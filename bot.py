@@ -18,9 +18,11 @@ from webhook_server import set_bot, start_webhook_thread
 def start_web():
     sys.path.insert(0, os.path.dirname(__file__))
     from web.app import app
-    print(f"[Web] 🌐 Dashboard: http://localhost:8080")
+    port = int(os.getenv("PORT", 8080))   # lấy port từ Render
+    print(f"[Web] 🌐 Dashboard: http://localhost:{port}")
     print(f"[Web] 👤 Đăng nhập: founder / admin123")
-    app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
 
 def start_web_thread():
     t = threading.Thread(target=start_web, daemon=True)
