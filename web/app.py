@@ -304,22 +304,11 @@ def logs():
     conn.close()
     return render_template("logs.html", logs=list(rows))
 
-
-if __name__ == "__main__":
-    # 1. Khởi tạo database cho bot/orders
-    db.init_db() 
     
-    # 2. Khởi tạo database cho tài khoản web
-    wdb.init_web_db()
-    
-    # 3. Chạy web
-    app.run(host="0.0.0.0", port=8080, debug=True)
-    
-    
-    @app.route("/accounts/<int:user_id>/edit", methods=["GET", "POST"])
-    @login_required
-    @role_required("founder")
-    def edit_account(user_id):
+@app.route("/accounts/<int:user_id>/edit", methods=["GET", "POST"])
+@login_required
+@role_required("founder")
+def edit_account(user_id):
         conn = wdb.get_conn()
         user = conn.execute("SELECT * FROM web_users WHERE id=?", (user_id,)).fetchone()
         conn.close()
@@ -450,3 +439,9 @@ def edit_product(product_id):
     conn.close()
     flash("✅ Đã cập nhật sản phẩm!", "success")
     return redirect(url_for("prices"))
+
+if __name__ == "__main__":
+    db.init_db()
+    wdb.init_web_db()
+    port = int(os.getenv("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False)
