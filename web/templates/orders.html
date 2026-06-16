@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Đơn hàng — Love Bot Store{% endblock %}
+
+{% block content %}
+<div class="mb-6 flex items-center justify-between">
+    <div>
+        <h1 class="text-2xl font-bold text-white">📦 Đơn hàng</h1>
+        <p class="text-gray-400">Quản lý tất cả đơn hàng</p>
+    </div>
+</div>
+
+<!-- Filter -->
+<div class="card p-4 mb-4 flex flex-wrap gap-3 items-center">
+    <form method="GET" class="flex flex-wrap gap-3 w-full">
+        <input type="text" name="search" value="{{ search }}" placeholder="🔍 Tìm mã đơn, khách, sản phẩm..." class="flex-1 min-w-48">
+        <select name="status">
+            <option value="all" {{ 'selected' if status_filter == 'all' }}>Tất cả</option>
+            <option value="pending"    {{ 'selected' if status_filter == 'pending' }}>Đang chờ</option>
+            <option value="processing" {{ 'selected' if status_filter == 'processing' }}>Đang xử lý</option>
+            <option value="paid"       {{ 'selected' if status_filter == 'paid' }}>Đã thanh toán</option>
+            <option value="done"       {{ 'selected' if status_filter == 'done' }}>Hoàn tất</option>
+            <option value="cancelled"  {{ 'selected' if status_filter == 'cancelled' }}>Đã hủy</option>
+        </select>
+        <button type="submit" class="btn-primary">Lọc</button>
+        <a href="/orders" class="btn-primary" style="background:#2d2d4e;">Reset</a>
+    </form>
+</div>
+
+<!-- Table -->
+<div class="card overflow-hidden">
+    <table class="w-full text-sm">
+        <thead>
+            <tr class="border-b border-gray-700 text-gray-400">
+                <th class="px-4 py-3 text-left">Mã đơn</th>
+                <th class="px-4 py-3 text-left">Khách hàng</th>
+                <th class="px-4 py-3 text-left">Sản phẩm</th>
+                <th class="px-4 py-3 text-left">Số tiền</th>
+                <th class="px-4 py-3 text-left">Trạng thái</th>
+                <th class="px-4 py-3 text-left">Thời gian</th>
+                <th class="px-4 py-3 text-left">Chi tiết</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for o in orders %}
+            <tr class="border-b border-gray-800 hover:bg-gray-800/30">
+                <td class="px-4 py-3 font-mono text-pink-400">{{ o.order_code }}</td>
+                <td class="px-4 py-3 text-gray-300">{{ o.username }}</td>
+                <td class="px-4 py-3 text-gray-300">{{ o.product_name }}</td>
+                <td class="px-4 py-3 text-white">{{ "{:,.0f}".format(o.amount).replace(",", ".") }} ₫</td>
+                <td class="px-4 py-3">
+                    <span class="px-2 py-0.5 rounded-full text-xs text-white status-{{ o.status }}">{{ o.status }}</span>
+                </td>
+                <td class="px-4 py-3 text-gray-400 text-xs">{{ o.created_at }}</td>
+                <td class="px-4 py-3">
+                    <a href="/orders/{{ o.order_code }}" class="text-pink-400 hover:underline">Xem →</a>
+                </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="7" class="text-center py-8 text-gray-500">Không có đơn hàng nào</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

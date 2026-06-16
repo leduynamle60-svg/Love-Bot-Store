@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Love Bot Store{% endblock %}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <style>
+        body { background: #0f0f1a; color: #e2e8f0; font-family: 'Segoe UI', sans-serif; }
+        .sidebar { background: #1a1a2e; border-right: 1px solid #2d2d4e; }
+        .card { background: #1a1a2e; border: 1px solid #2d2d4e; border-radius: 12px; }
+        .nav-link { transition: all 0.2s; border-radius: 8px; }
+        .nav-link:hover, .nav-link.active { background: #FF69B4; color: white; }
+        .badge-founder { background: #FFD700; color: #000; }
+        .badge-admin   { background: #3498DB; color: #fff; }
+        .badge-support { background: #2ECC71; color: #fff; }
+        .status-pending    { background: #F39C12; }
+        .status-processing { background: #3498DB; }
+        .status-paid       { background: #9B59B6; }
+        .status-done       { background: #2ECC71; }
+        .status-cancelled  { background: #E74C3C; }
+        input, select, textarea { background: #0f0f1a !important; border: 1px solid #2d2d4e !important; color: #e2e8f0 !important; border-radius: 8px; padding: 8px 12px; }
+        input:focus, select:focus { outline: none !important; border-color: #FF69B4 !important; }
+        .btn-primary { background: #FF69B4; color: white; border-radius: 8px; padding: 8px 16px; transition: 0.2s; }
+        .btn-primary:hover { background: #FF1493; }
+        .btn-danger { background: #E74C3C; color: white; border-radius: 8px; padding: 8px 16px; transition: 0.2s; }
+        .btn-danger:hover { background: #C0392B; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #1a1a2e; }
+        ::-webkit-scrollbar-thumb { background: #FF69B4; border-radius: 3px; }
+    </style>
+</head>
+<body class="flex h-screen overflow-hidden">
+
+{% if session.user_id %}
+<!-- Sidebar -->
+<div class="sidebar w-64 flex-shrink-0 flex flex-col h-full overflow-y-auto">
+    <div class="p-6 border-b border-gray-700">
+        <div class="flex items-center gap-3">
+            <div class="w-10 h-10 rounded-full bg-pink-500 flex items-center justify-center text-white font-bold text-lg">
+                {{ session.display[0].upper() }}
+            </div>
+            <div>
+                <div class="font-bold text-white">{{ session.display }}</div>
+                <span class="text-xs px-2 py-0.5 rounded-full badge-{{ session.role }}">{{ session.role.upper() }}</span>
+            </div>
+        </div>
+    </div>
+
+    <nav class="p-4 flex-1 space-y-1">
+        {% if session.role != 'support' %}
+        <a href="/dashboard" class="nav-link flex items-center gap-3 px-4 py-2.5 text-gray-300 {{ 'active' if request.path == '/dashboard' }}">
+            <i class="fa fa-chart-pie w-5"></i> Dashboard
+        </a>
+        <a href="/orders" class="nav-link flex items-center gap-3 px-4 py-2.5 text-gray-300 {{ 'active' if request.path == '/orders' }}">
+            <i class="fa fa-box w-5"></i> Đơn hàng
+        </a>
+        <a href="/customers" class="nav-link flex items-center gap-3 px-4 py-2.5 text-gray-300 {{ 'active' if request.path == '/customers' }}">
+            <i class="fa fa-users w-5"></i> Khách hàng
+        </a>
+        <a href="/feedbacks" class="nav-link flex items-center gap-3 px-4 py-2.5 text-gray-300 {{ 'active' if request.path == '/feedbacks' }}">
+            <i class="fa fa-star w-5"></i> Feedback
+        </a>
+        <a href="/logs" class="nav-link flex items-center gap-3 px-4 py-2.5 text-gray-300 {{ 'active' if request.path == '/logs' }}">
+            <i class="fa fa-list w-5"></i> Log
+        </a>
+        {% endif %}
+
+        {% if session.role == 'support' %}
+        <a href="/orders/my" class="nav-link flex items-center gap-3 px-4 py-2.5 text-gray-300 {{ 'active' if request.path == '/orders/my' }}">
+            <i class="fa fa-box w-5"></i> Đơn của tôi
+        </a>
+        {% endif %}
+
+        <a href="/prices" class="nav-link flex items-center gap-3 px-4 py-2.5 text-gray-300 {{ 'active' if request.path == '/prices' }}">
+            <i class="fa fa-tag w-5"></i> Bảng giá
+        </a>
+        <a href="/salary" class="nav-link flex items-center gap-3 px-4 py-2.5 text-gray-300 {{ 'active' if request.path == '/salary' }}">
+            <i class="fa fa-wallet w-5"></i> Lương
+        </a>
+
+        {% if session.role == 'founder' %}
+        <div class="pt-2 border-t border-gray-700 mt-2">
+            <a href="/accounts" class="nav-link flex items-center gap-3 px-4 py-2.5 text-gray-300 {{ 'active' if request.path == '/accounts' }}">
+                <i class="fa fa-user-cog w-5"></i> Tài khoản
+            </a>
+        </div>
+        {% endif %}
+    </nav>
+
+    <div class="p-4 border-t border-gray-700">
+        <a href="/logout" class="nav-link flex items-center gap-3 px-4 py-2.5 text-red-400">
+            <i class="fa fa-sign-out-alt w-5"></i> Đăng xuất
+        </a>
+    </div>
+</div>
+{% endif %}
+
+<!-- Main content -->
+<div class="flex-1 overflow-y-auto">
+    {% if session.user_id %}
+    <div class="p-6">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% for cat, msg in messages %}
+            <div class="mb-4 px-4 py-3 rounded-lg {{ 'bg-green-900 text-green-300' if cat == 'success' else 'bg-red-900 text-red-300' }}">
+                {{ msg }}
+            </div>
+            {% endfor %}
+        {% endwith %}
+        {% block content %}{% endblock %}
+    </div>
+    {% else %}
+        {% block auth %}{% endblock %}
+    {% endif %}
+</div>
+
+</body>
+</html>

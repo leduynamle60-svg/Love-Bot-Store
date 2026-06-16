@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Tài khoản — Love Bot Store{% endblock %}
+{% block content %}
+<div class="mb-6 flex items-center justify-between">
+    <div>
+        <h1 class="text-2xl font-bold text-white">⚙️ Quản lý tài khoản</h1>
+        <p class="text-gray-400">Tạo và quản lý tài khoản web</p>
+    </div>
+    <a href="/accounts/create" class="btn-primary"><i class="fa fa-plus mr-2"></i>Tạo tài khoản</a>
+</div>
+
+<div class="card overflow-hidden">
+    <table class="w-full text-sm">
+        <thead>
+            <tr class="border-b border-gray-700 text-gray-400">
+                <th class="px-4 py-3 text-left">Tên hiển thị</th>
+                <th class="px-4 py-3 text-left">Username</th>
+                <th class="px-4 py-3 text-left">Role</th>
+                <th class="px-4 py-3 text-left">Discord ID</th>
+                <th class="px-4 py-3 text-left">Tạo lúc</th>
+                <th class="px-4 py-3 text-left">Hành động</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for u in users %}
+            <tr class="border-b border-gray-800 hover:bg-gray-800/30">
+                <td class="px-4 py-3 text-white font-medium">{{ u.display_name }}</td>
+                <td class="px-4 py-3 text-gray-300 font-mono">{{ u.username }}</td>
+                <td class="px-4 py-3">
+                    <span class="px-2 py-0.5 rounded-full text-xs badge-{{ u.role }}">{{ u.role.upper() }}</span>
+                </td>
+                <td class="px-4 py-3 text-gray-400 font-mono text-xs">{{ u.discord_id or '—' }}</td>
+                <td class="px-4 py-3 text-gray-400 text-xs">{{ u.created_at }}</td>
+                <td class="px-4 py-3 flex gap-2 items-center flex-wrap">
+                    {% if u.id != session.user_id %}
+                    <form method="POST" action="/accounts/{{ u.id }}/reset" class="flex gap-2">
+                        <input type="text" name="new_password" placeholder="Mật khẩu mới" class="text-xs py-1 px-2" style="width:110px">
+                        <button type="submit" class="text-xs px-2 py-1 rounded" style="background:#3498DB;color:white">Reset</button>
+                    </form>
+                    <a href="/accounts/{{ u.id }}/edit" class="text-xs px-2 py-1 rounded" style="background:#F39C12;color:white">✏️ Sửa</a>
+                    <form method="POST" action="/accounts/{{ u.id }}/delete" onsubmit="return confirm('Xóa tài khoản này?')">
+                        <button type="submit" class="text-xs px-2 py-1 rounded btn-danger">Xóa</button>
+                    </form>
+                    {% else %}
+                    <span class="text-gray-600 text-xs">Tài khoản hiện tại</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" class="text-center py-8 text-gray-500">Chưa có tài khoản nào</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

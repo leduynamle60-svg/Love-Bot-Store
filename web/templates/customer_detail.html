@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Chi tiết khách hàng — Love Bot Store{% endblock %}
+{% block content %}
+<div class="mb-6">
+    <a href="/customers" class="text-gray-400 hover:text-pink-400 text-sm">← Quay lại</a>
+    <h1 class="text-2xl font-bold text-white mt-2">👤 Khách hàng #{{ user_id }}</h1>
+</div>
+
+<div class="card overflow-hidden">
+    <table class="w-full text-sm">
+        <thead>
+            <tr class="border-b border-gray-700 text-gray-400">
+                <th class="px-4 py-3 text-left">Mã đơn</th>
+                <th class="px-4 py-3 text-left">Sản phẩm</th>
+                <th class="px-4 py-3 text-left">Số tiền</th>
+                <th class="px-4 py-3 text-left">Trạng thái</th>
+                <th class="px-4 py-3 text-left">Thời gian</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for o in orders %}
+            <tr class="border-b border-gray-800">
+                <td class="px-4 py-3 font-mono text-pink-400">{{ o.order_code }}</td>
+                <td class="px-4 py-3 text-gray-300">{{ o.product_name }}</td>
+                <td class="px-4 py-3 text-white">{{ "{:,.0f}".format(o.amount).replace(",", ".") }} ₫</td>
+                <td class="px-4 py-3"><span class="px-2 py-0.5 rounded-full text-xs text-white status-{{ o.status }}">{{ o.status }}</span></td>
+                <td class="px-4 py-3 text-gray-400 text-xs">{{ o.created_at }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

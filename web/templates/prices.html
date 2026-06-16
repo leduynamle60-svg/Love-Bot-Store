@@ -1,0 +1,177 @@
+{% extends "base.html" %}
+{% block title %}Bảng giá — Love Bot Store{% endblock %}
+{% block content %}
+<div class="mb-6 flex items-center justify-between">
+    <div>
+        <h1 class="text-2xl font-bold text-white">🏷️ Bảng giá sản phẩm</h1>
+        <p class="text-gray-400">Tra cứu giá các mặt hàng</p>
+    </div>
+</div>
+
+{% if is_founder %}
+<!-- Form thêm sản phẩm -->
+<div class="card p-5 mb-6">
+    <h2 class="text-lg font-bold text-white mb-4">➕ Thêm sản phẩm mới</h2>
+    <form method="POST" action="/prices/add" class="flex flex-wrap gap-3">
+        <input type="text"   name="category"   placeholder="Danh mục (VD: Nicho Boost)" class="flex-1 min-w-40" required>
+        <input type="text"   name="name"        placeholder="Tên sản phẩm (VD: 1 Tháng)" class="flex-1 min-w-40" required>
+        <input type="number" name="price"       placeholder="Giá (VD: 90000)" class="w-36" required>
+        <select name="type" class="w-32">
+            <option value="log">Log</option>
+            <option value="gift">Gift</option>
+            <option value="family">Family</option>
+        </select>
+        <input type="text"   name="note"        placeholder="Ghi chú (tùy chọn)" class="flex-1 min-w-40">
+        <input type="number" name="sort_order"  placeholder="Thứ tự" class="w-20" value="0">
+        <button type="submit" class="btn-primary">Thêm</button>
+    </form>
+</div>
+{% endif %}
+
+<!-- Thanh tìm kiếm + sắp xếp -->
+<div class="card p-4 mb-4 flex flex-wrap gap-3 items-center">
+    <input type="text" id="searchInput" placeholder="🔍 Tìm tên sản phẩm..." class="flex-1 min-w-48" oninput="filterProducts()">
+    <select id="sortSelect" class="w-48" onchange="filterProducts()">
+        <option value="default">Sắp xếp mặc định</option>
+        <option value="price_asc">Giá: Thấp → Cao</option>
+        <option value="price_desc">Giá: Cao → Thấp</option>
+    </select>
+    <select id="typeSelect" class="w-36" onchange="filterProducts()">
+        <option value="all">Tất cả loại</option>
+        <option value="log">Log</option>
+        <option value="gift">Gift</option>
+        <option value="family">Family</option>
+    </select>
+    <button onclick="resetFilter()" class="btn-primary" style="background:#2d2d4e">Reset</button>
+</div>
+
+<!-- Bảng sản phẩm -->
+{% if categories %}
+<div id="productTable" class="card overflow-hidden">
+    <table class="w-full text-sm" id="mainTable">
+        <thead>
+            <tr class="border-b border-gray-700 text-gray-400">
+                <th class="px-4 py-3 text-left">Danh mục</th>
+                <th class="px-4 py-3 text-left">Tên sản phẩm</th>
+                <th class="px-4 py-3 text-left">Loại</th>
+                <th class="px-4 py-3 text-left">Ghi chú</th>
+                <th class="px-4 py-3 text-right">Giá</th>
+                {% if is_founder %}<th class="px-4 py-3 text-center">Hành động</th>{% endif %}
+            </tr>
+        </thead>
+        <tbody id="productBody">
+            {% for category, products in categories.items() %}
+            {% for p in products %}
+            <tr class="product-row border-b border-gray-800 hover:bg-gray-800/30"
+                data-name="{{ p.name | lower }}"
+                data-category="{{ p.category | lower }}"
+                data-price="{{ p.price }}"
+                data-type="{{ p.type or 'log' }}">
+                <td class="px-4 py-3 text-pink-400 font-medium">{{ p.category }}</td>
+                <td class="px-4 py-3 text-white">{{ p.name }}</td>
+                <td class="px-4 py-3">
+                    {% set t = p.type or 'log' %}
+                    {% if t == 'gift' %}
+                    <span class="px-2 py-0.5 rounded-full text-xs" style="background:#9B59B6;color:white">Gift</span>
+                    {% elif t == 'family' %}
+                    <span class="px-2 py-0.5 rounded-full text-xs" style="background:#E67E22;color:white">Family</span>
+                    {% else %}
+                    <span class="px-2 py-0.5 rounded-full text-xs" style="background:#3498DB;color:white">Log</span>
+                    {% endif %}
+                </td>
+                <td class="px-4 py-3 text-gray-500 text-xs">{{ p.note or '—' }}</td>
+                <td class="px-4 py-3 text-white font-bold text-right">
+                    {{ "{:,.0f}".format(p.price).replace(",", ".") }} ₫
+                </td>
+                {% if is_founder %}
+                <td class="px-4 py-3 text-center">
+                    <button onclick="toggleEdit({{ p.id }})" class="text-xs px-2 py-0.5 rounded mr-1" style="background:#F39C12;color:white">✏️</button>
+                    <form method="POST" action="/prices/{{ p.id }}/delete" class="inline" onsubmit="return confirm('Xóa sản phẩm này?')">
+                        <button type="submit" class="text-xs px-2 py-0.5 rounded btn-danger">🗑️</button>
+                    </form>
+                </td>
+                {% endif %}
+            </tr>
+            {% if is_founder %}
+            <tr id="edit-{{ p.id }}" class="hidden bg-gray-800/50">
+                <td colspan="6" class="py-2 px-4">
+                    <form method="POST" action="/prices/{{ p.id }}/edit" class="flex gap-2 flex-wrap items-center">
+                        <input type="text"   name="name"       value="{{ p.name }}"         placeholder="Tên" class="flex-1 min-w-32 text-xs py-1">
+                        <input type="number" name="price"      value="{{ p.price }}"         placeholder="Giá" class="w-28 text-xs py-1">
+                        <select name="type" class="w-28 text-xs py-1">
+                            <option value="log"    {{ 'selected' if (p.type or 'log') == 'log' }}>Log</option>
+                            <option value="gift"   {{ 'selected' if p.type == 'gift' }}>Gift</option>
+                            <option value="family" {{ 'selected' if p.type == 'family' }}>Family</option>
+                        </select>
+                        <input type="text"   name="note"       value="{{ p.note or '' }}"   placeholder="Ghi chú" class="flex-1 min-w-32 text-xs py-1">
+                        <input type="number" name="sort_order" value="{{ p.sort_order }}"   placeholder="Thứ tự" class="w-16 text-xs py-1">
+                        <button type="submit" class="text-xs px-3 py-1 rounded" style="background:#2ECC71;color:white">💾 Lưu</button>
+                        <button type="button" onclick="toggleEdit({{ p.id }})" class="text-xs px-3 py-1 rounded" style="background:#2d2d4e;color:white">Hủy</button>
+                    </form>
+                </td>
+            </tr>
+            {% endif %}
+            {% endfor %}
+            {% endfor %}
+        </tbody>
+    </table>
+    <div id="noResult" class="hidden text-center py-8 text-gray-500">Không tìm thấy sản phẩm nào 😕</div>
+</div>
+{% else %}
+<div class="card p-10 text-center text-gray-500">
+    Chưa có sản phẩm nào. {% if is_founder %}Thêm sản phẩm ở form bên trên!{% endif %}
+</div>
+{% endif %}
+
+<script>
+function filterProducts() {
+    const search   = document.getElementById('searchInput').value.toLowerCase();
+    const sort     = document.getElementById('sortSelect').value;
+    const typeFilter = document.getElementById('typeSelect').value;
+
+    const tbody = document.getElementById('productBody');
+    const rows  = Array.from(tbody.querySelectorAll('tr.product-row'));
+
+    // Filter
+    let visible = rows.filter(row => {
+        const name     = row.dataset.name || '';
+        const category = row.dataset.category || '';
+        const type     = row.dataset.type || '';
+        const matchSearch = name.includes(search) || category.includes(search);
+        const matchType   = typeFilter === 'all' || type === typeFilter;
+        return matchSearch && matchType;
+    });
+
+    // Sort
+    if (sort === 'price_asc') {
+        visible.sort((a, b) => parseInt(a.dataset.price) - parseInt(b.dataset.price));
+    } else if (sort === 'price_desc') {
+        visible.sort((a, b) => parseInt(b.dataset.price) - parseInt(a.dataset.price));
+    }
+
+    // Re-render
+    rows.forEach(r => {
+        r.style.display = 'none';
+        // Ẩn edit row đi
+        const editRow = document.getElementById('edit-' + r.dataset.id);
+        if (editRow) editRow.style.display = 'none';
+    });
+
+    visible.forEach(r => r.style.display = '');
+
+    document.getElementById('noResult').classList.toggle('hidden', visible.length > 0);
+}
+
+function resetFilter() {
+    document.getElementById('searchInput').value  = '';
+    document.getElementById('sortSelect').value   = 'default';
+    document.getElementById('typeSelect').value   = 'all';
+    filterProducts();
+}
+
+function toggleEdit(id) {
+    const row = document.getElementById('edit-' + id);
+    row.classList.toggle('hidden');
+}
+</script>
+{% endblock %}

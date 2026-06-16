@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Sửa tài khoản — Love Bot Store{% endblock %}
+{% block content %}
+<div class="mb-6">
+    <a href="/accounts" class="text-gray-400 hover:text-pink-400 text-sm">← Quay lại</a>
+    <h1 class="text-2xl font-bold text-white mt-2">✏️ Sửa tài khoản — {{ user.display_name }}</h1>
+</div>
+
+<div class="card p-6 max-w-lg">
+    <form method="POST" class="space-y-4">
+        <div>
+            <label class="block text-sm text-gray-400 mb-1">Tên hiển thị</label>
+            <input type="text" name="display_name" value="{{ user.display_name }}" class="w-full" required>
+        </div>
+        <div>
+            <label class="block text-sm text-gray-400 mb-1">Username <span class="text-gray-600">(không thể đổi)</span></label>
+            <input type="text" value="{{ user.username }}" class="w-full" disabled style="opacity:0.5">
+        </div>
+        <div>
+            <label class="block text-sm text-gray-400 mb-1">Role</label>
+            <select name="role" class="w-full">
+                <option value="support"  {{ 'selected' if user.role == 'support' }}>Support</option>
+                <option value="admin"    {{ 'selected' if user.role == 'admin' }}>Admin</option>
+                <option value="founder"  {{ 'selected' if user.role == 'founder' }}>Founder</option>
+            </select>
+        </div>
+        <div>
+            <label class="block text-sm text-gray-400 mb-1">Discord ID</label>
+            <input type="text" name="discord_id" value="{{ user.discord_id or '' }}" placeholder="VD: 123456789012345678" class="w-full">
+        </div>
+        <button type="submit" class="btn-primary w-full mt-2">
+            <i class="fa fa-save mr-2"></i>Lưu thay đổi
+        </button>
+    </form>
+</div>
+{% endblock %}

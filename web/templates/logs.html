@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Log — Love Bot Store{% endblock %}
+{% block content %}
+<div class="mb-6">
+    <h1 class="text-2xl font-bold text-white">📋 Log hoạt động</h1>
+    <p class="text-gray-400">200 log gần nhất</p>
+</div>
+
+<div class="card overflow-hidden">
+    <table class="w-full text-sm">
+        <thead>
+            <tr class="border-b border-gray-700 text-gray-400">
+                <th class="px-4 py-3 text-left">Thời gian</th>
+                <th class="px-4 py-3 text-left">Hành động</th>
+                <th class="px-4 py-3 text-left">Chi tiết</th>
+                <th class="px-4 py-3 text-left">Người thực hiện</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for l in logs %}
+            <tr class="border-b border-gray-800 hover:bg-gray-800/30">
+                <td class="px-4 py-3 text-gray-400 text-xs font-mono">{{ l.created_at }}</td>
+                <td class="px-4 py-3 text-pink-400">{{ l.action }}</td>
+                <td class="px-4 py-3 text-gray-300">{{ l.detail or '—' }}</td>
+                <td class="px-4 py-3 text-gray-400">{{ l.user }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="text-center py-8 text-gray-500">Chưa có log nào</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

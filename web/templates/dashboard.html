@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Love Bot Store{% endblock %}
+
+{% block content %}
+<div class="mb-6">
+    <h1 class="text-2xl font-bold text-white">📊 Dashboard</h1>
+    <p class="text-gray-400">Tổng quan Love Bot Store</p>
+</div>
+
+<!-- Stats Cards -->
+<div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+    <div class="card p-5">
+        <div class="text-gray-400 text-sm mb-1">Tổng đơn</div>
+        <div class="text-3xl font-bold text-white">{{ stats.total }}</div>
+        <div class="text-xs text-gray-500 mt-1"><i class="fa fa-box"></i> tất cả đơn</div>
+    </div>
+    <div class="card p-5">
+        <div class="text-gray-400 text-sm mb-1">Đã hoàn tất</div>
+        <div class="text-3xl font-bold text-green-400">{{ stats.done }}</div>
+        <div class="text-xs text-gray-500 mt-1"><i class="fa fa-check"></i> đơn done</div>
+    </div>
+    <div class="card p-5">
+        <div class="text-gray-400 text-sm mb-1">Đang xử lý</div>
+        <div class="text-3xl font-bold text-yellow-400">{{ stats.pending }}</div>
+        <div class="text-xs text-gray-500 mt-1"><i class="fa fa-clock"></i> chờ xử lý</div>
+    </div>
+    <div class="card p-5">
+        <div class="text-gray-400 text-sm mb-1">Doanh thu</div>
+        <div class="text-2xl font-bold text-pink-400">{{ "{:,.0f}".format(stats.revenue).replace(",", ".") }}</div>
+        <div class="text-xs text-gray-500 mt-1"><i class="fa fa-dong-sign"></i> VNĐ</div>
+    </div>
+    <div class="card p-5">
+        <div class="text-gray-400 text-sm mb-1">Đã hủy</div>
+        <div class="text-3xl font-bold text-red-400">{{ stats.cancelled }}</div>
+        <div class="text-xs text-gray-500 mt-1"><i class="fa fa-times"></i> đơn hủy</div>
+    </div>
+    <div class="card p-5">
+        <div class="text-gray-400 text-sm mb-1">Đánh giá TB</div>
+        <div class="text-3xl font-bold text-yellow-300">
+            {{ "%.1f"|format(stats.avg_stars) if stats.avg_stars else "—" }}
+        </div>
+        <div class="text-xs text-gray-500 mt-1"><i class="fa fa-star"></i> / 5 sao</div>
+    </div>
+    <div class="card p-5">
+        <div class="text-gray-400 text-sm mb-1">Feedback</div>
+        <div class="text-3xl font-bold text-blue-400">{{ stats.feedbacks }}</div>
+        <div class="text-xs text-gray-500 mt-1"><i class="fa fa-comment"></i> nhận xét</div>
+    </div>
+</div>
+
+<!-- Chart + Recent Orders -->
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+    <!-- Biểu đồ doanh thu -->
+    <div class="card p-5">
+        <h2 class="text-lg font-bold text-white mb-4">💰 Doanh thu 7 ngày</h2>
+        <canvas id="revenueChart" height="200"></canvas>
+    </div>
+
+    <!-- Đơn hàng gần đây -->
+    <div class="card p-5">
+        <h2 class="text-lg font-bold text-white mb-4">📦 Đơn hàng gần đây</h2>
+        <div class="space-y-2">
+            {% for o in recent_orders %}
+            <div class="flex items-center justify-between py-2 border-b border-gray-800">
+                <div>
+                    <span class="text-pink-400 font-mono text-sm">{{ o.order_code }}</span>
+                    <span class="text-gray-400 text-xs ml-2">{{ o.product_name }}</span>
+                </div>
+                <span class="text-xs px-2 py-0.5 rounded-full status-{{ o.status }} text-white">
+                    {{ o.status }}
+                </span>
+            </div>
+            {% endfor %}
+        </div>
+        <a href="/orders" class="text-pink-400 text-sm mt-3 block hover:underline">Xem tất cả →</a>
+    </div>
+</div>
+
+<script>
+const labels = {{ revenue_chart | map(attribute=0) | list | tojson }};
+const data   = {{ revenue_chart | map(attribute=1) | list | tojson }};
+
+new Chart(document.getElementById('revenueChart'), {
+    type: 'line',
+    data: {
+        labels: labels.length ? labels : ['Chưa có dữ liệu'],
+        datasets: [{
+            label: 'Doanh thu (VNĐ)',
+            data: data.length ? data : [0],
+            borderColor: '#FF69B4',
+            backgroundColor: 'rgba(255,105,180,0.1)',
+            fill: true,
+            tension: 0.4,
+            pointBackgroundColor: '#FF69B4',
+        }]
+    },
+    options: {
+        responsive: true,
+        plugins: { legend: { labels: { color: '#e2e8f0' } } },
+        scales: {
+            x: { ticks: { color: '#9ca3af' }, grid: { color: '#2d2d4e' } },
+            y: { ticks: { color: '#9ca3af' }, grid: { color: '#2d2d4e' } }
+        }
+    }
+});
+</script>
+{% endblock %}

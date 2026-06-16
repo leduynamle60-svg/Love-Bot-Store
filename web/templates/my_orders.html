@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Đơn của tôi — Love Bot Store{% endblock %}
+{% block content %}
+<div class="mb-6">
+    <h1 class="text-2xl font-bold text-white">📦 Đơn hàng của tôi</h1>
+    <p class="text-gray-400">Các đơn hàng bạn đã xử lý</p>
+</div>
+
+<div class="card overflow-hidden">
+    <table class="w-full text-sm">
+        <thead>
+            <tr class="border-b border-gray-700 text-gray-400">
+                <th class="px-4 py-3 text-left">Mã đơn</th>
+                <th class="px-4 py-3 text-left">Sản phẩm</th>
+                <th class="px-4 py-3 text-left">Số tiền</th>
+                <th class="px-4 py-3 text-left">Hoa hồng</th>
+                <th class="px-4 py-3 text-left">Trạng thái</th>
+                <th class="px-4 py-3 text-left">Thời gian</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for o in orders %}
+            <tr class="border-b border-gray-800 hover:bg-gray-800/30">
+                <td class="px-4 py-3 font-mono text-pink-400">{{ o.order_code }}</td>
+                <td class="px-4 py-3 text-gray-300">{{ o.product_name }}</td>
+                <td class="px-4 py-3 text-white">{{ "{:,.0f}".format(o.amount).replace(",", ".") }} ₫</td>
+                <td class="px-4 py-3 text-green-400">{{ "{:,.0f}".format(o.commission or 0).replace(",", ".") }} ₫</td>
+                <td class="px-4 py-3"><span class="px-2 py-0.5 rounded-full text-xs text-white status-{{ o.status }}">{{ o.status }}</span></td>
+                <td class="px-4 py-3 text-gray-400 text-xs">{{ o.created_at }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" class="text-center py-8 text-gray-500">Chưa có đơn hàng nào</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

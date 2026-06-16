@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Tạo tài khoản — Love Bot Store{% endblock %}
+{% block content %}
+<div class="mb-6">
+    <a href="/accounts" class="text-gray-400 hover:text-pink-400 text-sm">← Quay lại</a>
+    <h1 class="text-2xl font-bold text-white mt-2">➕ Tạo tài khoản mới</h1>
+</div>
+
+<div class="card p-6 max-w-lg">
+    <form method="POST" class="space-y-4">
+        <div>
+            <label class="block text-sm text-gray-400 mb-1">Tên hiển thị</label>
+            <input type="text" name="display_name" placeholder="VD: Support Minh" class="w-full" required>
+        </div>
+        <div>
+            <label class="block text-sm text-gray-400 mb-1">Username đăng nhập</label>
+            <input type="text" name="username" placeholder="VD: support_minh" class="w-full" required>
+        </div>
+        <div>
+            <label class="block text-sm text-gray-400 mb-1">Mật khẩu</label>
+            <input type="password" name="password" placeholder="Mật khẩu..." class="w-full" required>
+        </div>
+        <div>
+            <label class="block text-sm text-gray-400 mb-1">Role</label>
+            <select name="role" class="w-full">
+                <option value="support">Support</option>
+                <option value="admin">Admin</option>
+                <option value="founder">Founder</option>
+            </select>
+        </div>
+        <div>
+            <label class="block text-sm text-gray-400 mb-1">Discord ID (tùy chọn)</label>
+            <input type="text" name="discord_id" placeholder="VD: 123456789012345678" class="w-full">
+        </div>
+        <button type="submit" class="btn-primary w-full mt-2">
+            <i class="fa fa-plus mr-2"></i>Tạo tài khoản
+        </button>
+    </form>
+</div>
+{% endblock %}
