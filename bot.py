@@ -16,11 +16,11 @@ from webhook_server import set_bot, start_webhook_thread
 
 # ── Web Dashboard ─────────────────────────────────────────────
 def start_web():
-    sys.path.insert(0, os.path.dirname(__file__))
     from web.app import app
-    port = int(os.getenv("PORT", 8080))   # lấy port từ Render
-    print(f"[Web] 🌐 Dashboard: http://localhost:{port}")
-    print(f"[Web] 👤 Đăng nhập: founder / admin123")
+    # LẤY CỔNG TỪ RENDER CẤP. Nếu không có (khi chạy local), mặc định là 10000
+    port = int(os.environ.get("PORT", 10000)) 
+    print(f"[Web] 🌐 Dashboard đang khởi chạy tại port: {port}")
+    # Đảm bảo app chạy trên host 0.0.0.0 và port này
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 
