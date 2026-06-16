@@ -24,6 +24,7 @@ def init_db():
         category    TEXT    NOT NULL,
         name        TEXT    NOT NULL,
         price       INTEGER NOT NULL,
+        type        TEXT    DEFAULT 'log',  -- <--- THÊM DÒNG NÀY VÀO
         note        TEXT,
         sort_order  INTEGER DEFAULT 0,
         created_at  TEXT    DEFAULT (datetime('now','localtime'))
