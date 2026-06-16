@@ -31,11 +31,13 @@ BANK_BIN             = os.getenv("BANK_BIN")
 
 # --- Web ---
 WEB_SECRET_KEY = os.getenv("WEB_SECRET_KEY", "fallback-secret-key")
+WEBHOOK_HOST   = os.getenv("WEBHOOK_HOST", "0.0.0.0")
 WEBHOOK_PORT   = int(os.getenv("WEBHOOK_PORT", 5000))
 WEB_PORT       = int(os.getenv("WEB_PORT", 8080))
 
+
 # --- Màu embed ---
-COLOR_PRIMARY = 0xFF0000
+COLOR_PRIMARY = 0xFF69B4
 COLOR_SUCCESS = 0x2ECC71
 COLOR_ERROR   = 0xE74C3C
 COLOR_WARNING = 0xF39C12
