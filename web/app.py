@@ -304,35 +304,6 @@ def logs():
     conn.close()
     return render_template("logs.html", logs=list(rows))
 
-    
-@app.route("/accounts/<int:user_id>/edit", methods=["GET", "POST"])
-@login_required
-@role_required("founder")
-def edit_account(user_id):
-        conn = wdb.get_conn()
-        user = conn.execute("SELECT * FROM web_users WHERE id=?", (user_id,)).fetchone()
-        conn.close()
-
-        if not user:
-            flash("❌ Không tìm thấy tài khoản!", "error")
-            return redirect(url_for("accounts"))
-
-        if request.method == "POST":
-            display_name = request.form.get("display_name", "").strip()
-            role         = request.form.get("role", "support")
-            discord_id   = request.form.get("discord_id", "").strip()
-
-            conn = wdb.get_conn()
-            conn.execute(
-                "UPDATE web_users SET display_name=?, role=?, discord_id=? WHERE id=?",
-                (display_name, role, discord_id, user_id)
-            )
-            conn.commit()
-            conn.close()
-            flash(f"✅ Đã cập nhật tài khoản!", "success")
-            return redirect(url_for("accounts"))
-
-        return render_template("edit_account.html", user=user)
 
 @app.route("/accounts/<int:user_id>/edit", methods=["GET", "POST"])
 @login_required
