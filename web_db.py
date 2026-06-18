@@ -1,9 +1,10 @@
 """
-web_db.py — Database cho Web Dashboard (users, salary, logs)
+web_db.py — Database web dashboard dùng SQLite
 """
 
-import sqlite3, hashlib, os
-from datetime import datetime
+import sqlite3
+import hashlib
+import os
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "store.db")
 
@@ -22,7 +23,6 @@ def init_web_db():
     conn = get_conn()
     c    = conn.cursor()
 
-    # Bảng tài khoản web
     c.execute("""
         CREATE TABLE IF NOT EXISTS web_users (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,7 +35,6 @@ def init_web_db():
         )
     """)
 
-    # Bảng log hoạt động
     c.execute("""
         CREATE TABLE IF NOT EXISTS logs (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,19 +45,17 @@ def init_web_db():
         )
     """)
 
-    # Bảng lương support
     c.execute("""
         CREATE TABLE IF NOT EXISTS salary (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             web_user_id  INTEGER NOT NULL,
-            order_code   TEXT    NOT NULL,
+            order_code   TEXT    NOT NULL UNIQUE,
             amount       INTEGER DEFAULT 0,
             note         TEXT,
             created_at   TEXT    DEFAULT (datetime('now','localtime'))
         )
     """)
 
-    # Tạo tài khoản Founder mặc định nếu chưa có
     exists = c.execute("SELECT 1 FROM web_users WHERE role='founder'").fetchone()
     if not exists:
         c.execute(
@@ -84,8 +81,8 @@ def verify_user(username, password):
 
 
 def get_all_users():
-    conn  = get_conn()
-    rows  = conn.execute("SELECT * FROM web_users ORDER BY role, username").fetchall()
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM web_users ORDER BY role, username").fetchall()
     conn.close()
     return list(rows)
 
@@ -155,9 +152,8 @@ def get_salary_by_support(web_user_id):
 
 
 def get_orders_by_support(web_user_id):
-    """Lấy đơn hàng mà support này đã xử lý (dựa vào bảng salary)"""
-    conn  = get_conn()
-    rows  = conn.execute("""
+    conn = get_conn()
+    rows = conn.execute("""
         SELECT o.*, s.amount as commission
         FROM orders o
         JOIN salary s ON o.order_code = s.order_code
@@ -177,8 +173,6 @@ def add_salary_record(web_user_id, order_code, amount=0, note=""):
     conn.commit()
     conn.close()
 
-
-# ── Logs ──────────────────────────────────────────────────────
 
 def add_log(action, detail="", user="System"):
     conn = get_conn()
