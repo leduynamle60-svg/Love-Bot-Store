@@ -150,7 +150,7 @@ class AdminCog(commands.Cog):
             description=(
                 "Truy cập web dashboard tại link bên dưới:\n\n"
                 "🔗 **Local:** http://localhost:10000\n"
-                "🔗 **Public:** `Chưa có link public`\n\n"
+                "🔗 **Public:** https://love-bot-store-pqjc.onrender.com\n\n"
                 "Đăng nhập bằng tài khoản được Founder cấp nhé!"
             ),
             color=config.COLOR_INFO,
