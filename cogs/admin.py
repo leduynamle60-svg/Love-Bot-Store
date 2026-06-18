@@ -33,7 +33,8 @@ class AdminCog(commands.Cog):
                 "`!qr <số tiền>` — Tạo QR thanh toán tự động\n"
                 "`!done` — Hoàn tất đơn, gửi feedback cho khách\n"
                 "`!cancel` — Hủy đơn\n"
-                "`!check3m` — Link check điều kiện Nicho Trail"
+                "`!check3m` — Link check điều kiện Nicho Trail\n"
+                "`!web` — Hiện link truy cập web dashboard\n"
             ),
             inline=False
         )
@@ -141,6 +142,30 @@ class AdminCog(commands.Cog):
         await ctx.send(embed=embed)
         await ctx.message.delete()
 
+    
+    @commands.command(name="web")
+    async def cmd_web(self, ctx):
+        embed = discord.Embed(
+            title="🌐 Love Bot Store — Web Dashboard",
+            description=(
+                "Truy cập web dashboard tại link bên dưới:\n\n"
+                "🔗 **Local:** http://localhost:10000\n"
+                "🔗 **Public:** `Chưa có link public`\n\n"
+                "Đăng nhập bằng tài khoản được Founder cấp nhé!"
+            ),
+            color=config.COLOR_INFO,
+            timestamp=datetime.now()
+        )
+
+        embed.set_footer(text=config.BOT_FOOTER)
+
+        await ctx.send(embed=embed)
+
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+
     @stats.error
     @lookup.error
     async def founder_error(self, ctx, error):
@@ -150,3 +175,4 @@ class AdminCog(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(AdminCog(bot))
+

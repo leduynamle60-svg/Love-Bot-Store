@@ -27,61 +27,71 @@ class OpenTicketView(discord.ui.View):
 
     @discord.ui.button(label="🛒  Mua hàng", style=discord.ButtonStyle.primary, custom_id="open_ticket")
     async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        guild  = interaction.guild
-        member = interaction.user
+        try:
+            await interaction.response.defer(ephemeral=True)
+            guild  = interaction.guild
+            member = interaction.user
 
-        if db.count_open_tickets(member.id) >= config.MAX_TICKETS_PER_USER:
-            return await interaction.followup.send(
-                "❌ Bạn đang có ticket chưa xử lý. Vui lòng chờ Support hoàn tất đơn cũ!",
-                ephemeral=True
+            if db.count_open_tickets(member.id) >= config.MAX_TICKETS_PER_USER:
+                return await interaction.followup.send(
+                    "❌ Bạn đang có ticket chưa xử lý. Vui lòng chờ Support hoàn tất đơn cũ!",
+                    ephemeral=True
+                )
+
+            category     = guild.get_channel(config.TICKET_CATEGORY_ID)
+            support_role = guild.get_role(config.SUPPORT_ROLE_ID)
+            founder_role = guild.get_role(config.FOUNDER_ROLE_ID)
+
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            }
+            if support_role:
+                overwrites[support_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+            if founder_role:
+                overwrites[founder_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+            channel_name = f"{config.TICKET_PREFIX}-{member.name}".lower().replace(" ", "-")[:32]
+            ticket_ch = await guild.create_text_channel(
+                name=channel_name, category=category, overwrites=overwrites,
+                reason=f"Ticket mua hàng của {member}"
             )
 
-        category     = guild.get_channel(config.TICKET_CATEGORY_ID)
-        support_role = guild.get_role(config.SUPPORT_ROLE_ID)
-        founder_role = guild.get_role(config.FOUNDER_ROLE_ID)
+            order_code = gen_order_code()
+            db.open_ticket(ticket_ch.id, member.id, order_code)
 
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-        }
-        if support_role:
-            overwrites[support_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-        if founder_role:
-            overwrites[founder_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+            embed = discord.Embed(
+                title="🎀 Love Bot Store — Ticket Mua Hàng",
+                description=(
+                    f"Xin chào {member.mention}! 👋\n\n"
+                    f"Cảm ơn bạn đã liên hệ **{config.BOT_NAME}**.\n"
+                    f"Mã đơn hàng của bạn: `{order_code}`\n\n"
+                    "📌 **Hướng dẫn:**\n"
+                    "• Cho Support biết bạn muốn mua sản phẩm nào\n"
+                    "• Chuẩn bị đầy đủ các thông tin cho vật phẩm cần mua\n"
+                    "• Nếu sau 15 phút vẫn chưa thấy hỗ trợ, hãy ping họ.\n\n"
+                    "⏳ Vui lòng chờ Support hỗ trợ..."
+                ),
+                color=config.COLOR_PRIMARY,
+                timestamp=datetime.now()
+            )
+            embed.set_footer(text=config.BOT_FOOTER)
+            if config.BOT_AVATAR:
+                embed.set_thumbnail(url=config.BOT_AVATAR)
 
-        channel_name = f"{config.TICKET_PREFIX}-{member.name}".lower().replace(" ", "-")[:32]
-        ticket_ch = await guild.create_text_channel(
-            name=channel_name, category=category, overwrites=overwrites,
-            reason=f"Ticket mua hàng của {member}"
-        )
+            ping_msg = f"{support_role.mention if support_role else ''} {founder_role.mention if founder_role else ''}"
+            await ticket_ch.send(ping_msg.strip(), embed=embed, view=CloseTicketView())
+            await interaction.followup.send(f"✅ Ticket của bạn đã được tạo: {ticket_ch.mention}", ephemeral=True)
+            await _log(guild, f"🎫 Ticket mới: {ticket_ch.mention} — {member.mention} (`{order_code}`)")
 
-        order_code = gen_order_code()
-        db.open_ticket(ticket_ch.id, member.id, order_code)
-
-        embed = discord.Embed(
-            title="🎀 Love Bot Store — Ticket Mua Hàng",
-            description=(
-                f"Xin chào {member.mention}! 👋\n\n"
-                f"Cảm ơn bạn đã liên hệ **{config.BOT_NAME}**.\n"
-                f"Mã đơn hàng của bạn: `{order_code}`\n\n"
-                "📌 **Hướng dẫn:**\n"
-                "• Cho Support biết bạn muốn mua sản phẩm nào\n"
-                "• Chuẩn bị đầy đủ các thông tin cho vật phẩm cần mua\n"
-                "• Nếu sau 15 phút vẫn chưa thấy hỗ trợ, hãy ping họ.\n\n"
-                "⏳ Vui lòng chờ Support hỗ trợ..."
-            ),
-            color=config.COLOR_PRIMARY,
-            timestamp=datetime.now()
-        )
-        embed.set_footer(text=config.BOT_FOOTER)
-        if config.BOT_AVATAR:
-            embed.set_thumbnail(url=config.BOT_AVATAR)
-
-        ping_msg = f"{support_role.mention if support_role else ''} {founder_role.mention if founder_role else ''}"
-        await ticket_ch.send(ping_msg.strip(), embed=embed, view=CloseTicketView())
-        await interaction.followup.send(f"✅ Ticket của bạn đã được tạo: {ticket_ch.mention}", ephemeral=True)
-        await _log(guild, f"🎫 Ticket mới: {ticket_ch.mention} — {member.mention} (`{order_code}`)")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[ERROR open_ticket] {e}")
+            try:
+                await interaction.followup.send(f"❌ Lỗi: `{e}`", ephemeral=True)
+            except:
+                pass
 
 
 class OpenSupportView(discord.ui.View):
@@ -207,7 +217,6 @@ class FeedbackModal(discord.ui.Modal, title="📝 Đánh giá đơn hàng"):
         self.stars      = stars
         self.customer   = customer
 
-    # ← ĐÚNG: on_submit nằm TRONG class FeedbackModal
     async def on_submit(self, interaction: discord.Interaction):
         try:
             stars_str = "⭐" * self.stars + "✩" * (5 - self.stars)
