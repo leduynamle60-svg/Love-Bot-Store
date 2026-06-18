@@ -1,10 +1,8 @@
 """
 web/app.py — Flask Web Dashboard cho Love Bot Store
-Chạy: python web/app.py
 """
 
-from discord import user
-from flask import Flask, render_template, redirect, url_for, request, session, flash, jsonify
+from flask import Flask, render_template, redirect, url_for, request, session, flash
 from functools import wraps
 from datetime import datetime
 import sys, os
@@ -80,17 +78,17 @@ def dashboard():
         return redirect(url_for("my_orders"))
 
     conn = db.get_conn()
+
     stats = {
-        "total":    conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
-        "done":     conn.execute("SELECT COUNT(*) FROM orders WHERE status='done'").fetchone()[0],
-        "pending":  conn.execute("SELECT COUNT(*) FROM orders WHERE status NOT IN ('done','cancelled')").fetchone()[0],
-        "cancelled":conn.execute("SELECT COUNT(*) FROM orders WHERE status='cancelled'").fetchone()[0],
-        "revenue":  conn.execute("SELECT SUM(amount) FROM orders WHERE status IN ('paid','done')").fetchone()[0] or 0,
-        "avg_stars":conn.execute("SELECT AVG(stars) FROM feedbacks").fetchone()[0],
-        "feedbacks":conn.execute("SELECT COUNT(*) FROM feedbacks").fetchone()[0],
+        "total":     conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
+        "done":      conn.execute("SELECT COUNT(*) FROM orders WHERE status='done'").fetchone()[0],
+        "pending":   conn.execute("SELECT COUNT(*) FROM orders WHERE status NOT IN ('done','cancelled')").fetchone()[0],
+        "cancelled": conn.execute("SELECT COUNT(*) FROM orders WHERE status='cancelled'").fetchone()[0],
+        "revenue":   conn.execute("SELECT COALESCE(SUM(amount),0) FROM orders WHERE status IN ('paid','done')").fetchone()[0],
+        "avg_stars": conn.execute("SELECT AVG(stars) FROM feedbacks").fetchone()[0],
+        "feedbacks": conn.execute("SELECT COUNT(*) FROM feedbacks").fetchone()[0],
     }
 
-    # Doanh thu 7 ngày gần nhất
     revenue_chart = conn.execute("""
         SELECT DATE(created_at) as date, SUM(amount) as total
         FROM orders WHERE status IN ('paid','done')
@@ -98,10 +96,9 @@ def dashboard():
         GROUP BY DATE(created_at) ORDER BY date
     """).fetchall()
 
-    # Đơn hàng mới nhất
-    recent_orders = conn.execute("""
-        SELECT * FROM orders ORDER BY created_at DESC LIMIT 10
-    """).fetchall()
+    recent_orders = conn.execute(
+        "SELECT * FROM orders ORDER BY created_at DESC LIMIT 10"
+    ).fetchall()
 
     conn.close()
     return render_template("dashboard.html",
@@ -120,8 +117,8 @@ def orders():
     status_filter = request.args.get("status", "all")
     search        = request.args.get("search", "").strip()
 
-    conn  = db.get_conn()
-    query = "SELECT * FROM orders WHERE 1=1"
+    conn   = db.get_conn()
+    query  = "SELECT * FROM orders WHERE 1=1"
     params = []
 
     if status_filter != "all":
@@ -140,10 +137,7 @@ def orders():
 @app.route("/orders/my")
 @login_required
 def my_orders():
-    """Support chỉ xem đơn mình xử lý"""
-    conn  = db.get_conn()
-    rows  = wdb.get_orders_by_support(session["user_id"])
-    conn.close()
+    rows = wdb.get_orders_by_support(session["user_id"])
     return render_template("my_orders.html", orders=rows)
 
 
@@ -152,9 +146,11 @@ def my_orders():
 @role_required("founder", "admin")
 def order_detail(order_code):
     order    = db.get_order(order_code)
-    feedback = db.get_conn().execute(
+    conn     = db.get_conn()
+    feedback = conn.execute(
         "SELECT * FROM feedbacks WHERE order_code=?", (order_code,)
     ).fetchone()
+    conn.close()
     return render_template("order_detail.html", order=order, feedback=feedback)
 
 
@@ -164,6 +160,33 @@ def order_detail(order_code):
 def update_order(order_code):
     status = request.form.get("status")
     db.update_order_status(order_code, status)
+
+    # Map status sang text hiển thị
+    status_map = {
+        "pending":    "⏳ Đang chờ",
+        "processing": "🔄 Đang xử lý",
+        "paid":       "💳 Đã thanh toán",
+        "done":       "✅ Hoàn tất",
+        "cancelled":  "❌ Đã hủy",
+    }
+    status_color = {
+        "pending":    0xF39C12,
+        "processing": 0x3498DB,
+        "paid":       0x9B59B6,
+        "done":       0x2ECC71,
+        "cancelled":  0xE74C3C,
+    }
+
+    # Gửi lệnh update embed vào bot qua file tạm
+    import json
+    with open("pending_updates.json", "a") as f:
+        f.write(json.dumps({
+            "order_code": order_code,
+            "status":     status,
+            "status_text": status_map.get(status, status),
+            "color":      status_color.get(status, 0x3498DB)
+        }) + "\n")
+
     flash(f"✅ Đã cập nhật trạng thái đơn `{order_code}`!", "success")
     return redirect(url_for("order_detail", order_code=order_code))
 
@@ -186,13 +209,13 @@ def delete_order(order_code):
 @login_required
 @role_required("founder", "admin")
 def customers():
-    conn  = db.get_conn()
-    rows  = conn.execute("""
+    conn = db.get_conn()
+    rows = conn.execute("""
         SELECT user_id, username,
                COUNT(*) as total_orders,
                SUM(CASE WHEN status IN ('paid','done') THEN amount ELSE 0 END) as total_spent,
                MAX(created_at) as last_order
-        FROM orders GROUP BY user_id ORDER BY total_spent DESC
+        FROM orders GROUP BY user_id, username ORDER BY total_spent DESC
     """).fetchall()
     conn.close()
     return render_template("customers.html", customers=list(rows))
@@ -235,7 +258,7 @@ def salary():
         return render_template("salary.html", salary_data=[data] if data else [], is_all=False)
 
 
-# ── Quản lý tài khoản web (Founder only) ─────────────────────
+# ── Quản lý tài khoản ────────────────────────────────────────
 
 @app.route("/accounts")
 @login_required
@@ -262,10 +285,40 @@ def create_account():
             flash("❌ Tên đăng nhập đã tồn tại!", "error")
         else:
             wdb.create_user(username, password, display_name, role, discord_id)
-            flash(f"✅ Đã tạo tài khoản **{username}** ({role})!", "success")
+            flash(f"✅ Đã tạo tài khoản {username} ({role})!", "success")
             return redirect(url_for("accounts"))
 
     return render_template("create_account.html")
+
+
+@app.route("/accounts/<int:user_id>/edit", methods=["GET", "POST"])
+@login_required
+@role_required("founder")
+def edit_account(user_id):
+    conn = wdb.get_conn()
+    user = conn.execute("SELECT * FROM web_users WHERE id=?", (user_id,)).fetchone()
+    conn.close()
+
+    if not user:
+        flash("❌ Không tìm thấy tài khoản!", "error")
+        return redirect(url_for("accounts"))
+
+    if request.method == "POST":
+        display_name = request.form.get("display_name", "").strip()
+        role         = request.form.get("role", "support")
+        discord_id   = request.form.get("discord_id", "").strip()
+
+        conn = wdb.get_conn()
+        conn.execute(
+            "UPDATE web_users SET display_name=?, role=?, discord_id=? WHERE id=?",
+            (display_name, role, discord_id, user_id)
+        )
+        conn.commit()
+        conn.close()
+        flash("✅ Đã cập nhật tài khoản!", "success")
+        return redirect(url_for("accounts"))
+
+    return render_template("edit_account.html", user=user)
 
 
 @app.route("/accounts/<int:user_id>/delete", methods=["POST"])
@@ -305,35 +358,6 @@ def logs():
     return render_template("logs.html", logs=list(rows))
 
 
-@app.route("/accounts/<int:user_id>/edit", methods=["GET", "POST"])
-@login_required
-@role_required("founder")
-def edit_account(user_id):
-    conn = wdb.get_conn()
-    user = conn.execute("SELECT * FROM web_users WHERE id=?", (user_id,)).fetchone()
-    conn.close()
-
-    if not user:
-        flash("❌ Không tìm thấy tài khoản!", "error")
-        return redirect(url_for("accounts"))
-
-    if request.method == "POST":
-        display_name = request.form.get("display_name", "").strip()
-        role         = request.form.get("role", "support")
-        discord_id   = request.form.get("discord_id", "").strip()
-
-        conn = wdb.get_conn()
-        conn.execute(
-            "UPDATE web_users SET display_name=?, role=?, discord_id=? WHERE id=?",
-            (display_name, role, discord_id, user_id)
-        )
-        conn.commit()
-        conn.close()
-        flash("✅ Đã cập nhật tài khoản!", "success")
-        return redirect(url_for("accounts"))
-
-    return render_template("edit_account.html", user=user)
-
 # ── Bảng giá ─────────────────────────────────────────────────
 
 @app.route("/prices")
@@ -343,7 +367,6 @@ def prices():
     rows = conn.execute("SELECT * FROM products ORDER BY category, sort_order, id").fetchall()
     conn.close()
 
-    # Nhóm theo category
     from collections import defaultdict
     categories = defaultdict(list)
     for r in rows:
@@ -375,7 +398,7 @@ def add_product():
     )
     conn.commit()
     conn.close()
-    flash(f"✅ Đã thêm sản phẩm **{name}**!", "success")
+    flash(f"✅ Đã thêm sản phẩm {name}!", "success")
     return redirect(url_for("prices"))
 
 
@@ -395,11 +418,11 @@ def delete_product(product_id):
 @login_required
 @role_required("founder")
 def edit_product(product_id):
-    name   = request.form.get("name", "").strip()
-    price  = request.form.get("price", "0").strip()
-    type_  = request.form.get("type", "log").strip()
-    note   = request.form.get("note", "").strip()
-    order  = request.form.get("sort_order", "0").strip()
+    name  = request.form.get("name", "").strip()
+    price = request.form.get("price", "0").strip()
+    type_ = request.form.get("type", "log").strip()
+    note  = request.form.get("note", "").strip()
+    order = request.form.get("sort_order", "0").strip()
 
     conn = db.get_conn()
     conn.execute(
@@ -411,8 +434,8 @@ def edit_product(product_id):
     flash("✅ Đã cập nhật sản phẩm!", "success")
     return redirect(url_for("prices"))
 
+
 if __name__ == "__main__":
-    db.init_db()
     wdb.init_web_db()
-    port = int(os.getenv("PORT", 8080))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
