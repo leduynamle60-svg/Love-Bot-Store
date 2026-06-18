@@ -50,6 +50,21 @@ async def on_ready():
     bot.add_view(OpenSupportView())
     bot.add_view(CloseTicketView())
 
+    # Self ping để tránh Render spin down
+    async def self_ping():
+        await asyncio.sleep(60)
+        while not bot.is_closed():
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as s:
+                    async with s.get("https://love-bot-store-pqjc.onrender.com") as r:
+                        print(f"[Ping] ✅ {r.status}")
+            except Exception as e:
+                print(f"[Ping] ❌ {e}")
+            await asyncio.sleep(300)
+
+    asyncio.create_task(self_ping())
+
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.watching,
