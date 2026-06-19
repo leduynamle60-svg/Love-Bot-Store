@@ -24,6 +24,18 @@ def make_qr_url(amount: int, order_code: str) -> str:
     )
 
 
+def parse_amount(text: str) -> int:
+    """Chuyển '20k', '1m', '1.5m', '20000' thành số nguyên VNĐ"""
+    text = text.strip().lower().replace(",", ".")
+
+    if text.endswith("k"):
+        return int(float(text[:-1]) * 1_000)
+    elif text.endswith("m"):
+        return int(float(text[:-1]) * 1_000_000)
+    else:
+        return int(float(text))
+
+
 class OrderCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -34,7 +46,7 @@ class OrderCog(commands.Cog):
             channel.name.startswith("support-")
         )
 
-# ── !order <tên sản phẩm> ────────────────────────────────
+    # ── !order <tên sản phẩm> ────────────────────────────────
     @commands.command(name="order")
     async def cmd_order(self, ctx, *, product_name: str):
         try:
@@ -156,13 +168,21 @@ class OrderCog(commands.Cog):
 
     # ── !qr <số tiền> ────────────────────────────────────────
     @commands.command(name="qr")
-    async def cmd_qr(self, ctx, amount: int):
+    async def cmd_qr(self, ctx, amount_str: str):
         try:
             if not is_support_or_founder(ctx.author):
                 return await ctx.send("❌ Chỉ Support/Founder mới dùng lệnh này!", delete_after=5)
 
             if not self._in_ticket(ctx.channel):
                 return await ctx.send("❌ Lệnh này chỉ dùng được trong ticket!", delete_after=5)
+
+            try:
+                amount = parse_amount(amount_str)
+            except (ValueError, IndexError):
+                return await ctx.send(
+                    "❌ Số tiền không hợp lệ!\nVD: `!qr 20k`, `!qr 1m`, `!qr 50000`",
+                    delete_after=8
+                )
 
             if amount <= 0:
                 return await ctx.send("❌ Số tiền phải lớn hơn 0!", delete_after=5)
@@ -214,7 +234,7 @@ class OrderCog(commands.Cog):
             traceback.print_exc()
             await ctx.send(f"❌ Lỗi: `{e}`")
 
-# ── !done ─────────────────────────────────────────────────
+    # ── !done ─────────────────────────────────────────────────
     @commands.command(name="done")
     async def cmd_done(self, ctx):
         try:
@@ -267,7 +287,6 @@ class OrderCog(commands.Cog):
                 amt        = order_info["amount"]
                 commission = 5000 + (int(amt * 0.10) if amt >= 100000 else 0)
 
-                # Lương Admin/Founder (người dùng !done)
                 conn     = wdb.get_conn()
                 web_user = conn.execute(
                     "SELECT * FROM web_users WHERE discord_id=?", (str(ctx.author.id),)
@@ -278,7 +297,6 @@ class OrderCog(commands.Cog):
                                           f"Xử lý đơn {order_code} — {amt:,}đ", role_in_order="admin")
                     print(f"[Salary-Admin] {ctx.author} — {order_code} — +{commission:,}đ")
 
-                # Lương Support (người dùng !order)
                 if support_row:
                     conn = wdb.get_conn()
                     support_web_user = conn.execute(
@@ -290,7 +308,6 @@ class OrderCog(commands.Cog):
                                               f"Hỗ trợ đơn {order_code} — {amt:,}đ", role_in_order="support")
                         print(f"[Salary-Support] {support_row['support_discord_id']} — {order_code} — +{commission:,}đ")
 
-                # Cập nhật embed trong #order
                 order_ch = ctx.guild.get_channel(config.ORDER_CHANNEL_ID)
                 if order_ch:
                     async for msg in order_ch.history(limit=50):
@@ -312,7 +329,6 @@ class OrderCog(commands.Cog):
                                 await msg.edit(embed=new_embed)
                                 break
 
-            # ── Embed thông tin đầy đủ trong ticket (KHÔNG xóa tin nhắn) ──
             info_embed = discord.Embed(
                 title="✅ Đơn Hàng Hoàn Tất",
                 color=config.COLOR_SUCCESS,
@@ -325,7 +341,6 @@ class OrderCog(commands.Cog):
             info_embed.set_footer(text=config.BOT_FOOTER)
             await ctx.send(embed=info_embed)
 
-            # ── Embed feedback cho khách trong ticket ──
             fb_embed = discord.Embed(
                 title="🎉 Đơn hàng hoàn tất!",
                 description=(
@@ -350,7 +365,6 @@ class OrderCog(commands.Cog):
                 )
                 await ctx.send(embed=fb_embed)
 
-            # ── Gửi DM cho khách kèm nút tip ──
             if customer:
                 try:
                     dm_embed = discord.Embed(
@@ -391,10 +405,8 @@ class OrderCog(commands.Cog):
 
     @cmd_qr.error
     async def qr_error(self, ctx, error):
-        if isinstance(error, commands.BadArgument):
-            await ctx.send("❌ Số tiền không hợp lệ!\nCú pháp: `!qr <số tiền>` (VD: `!qr 50000`)", delete_after=8)
-        elif isinstance(error, commands.MissingRequiredArgument):
-            await ctx.send("❌ Thiếu số tiền!\nCú pháp: `!qr <số tiền>`", delete_after=8)
+        if isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send("❌ Thiếu số tiền!\nVD: `!qr 20k`, `!qr 1m`, `!qr 50000`", delete_after=8)
 
 
 class TipView(discord.ui.View):
@@ -419,7 +431,6 @@ class TipView(discord.ui.View):
                 f"❌ Không tìm thấy thông tin {role_label.lower()}!", ephemeral=True
             )
 
-        # Lấy STK từ web_users (nếu Founder đã cập nhật)
         import web_db as wdb
         conn = wdb.get_conn()
         web_user = conn.execute(
@@ -433,8 +444,7 @@ class TipView(discord.ui.View):
         )
         embed.add_field(name="👤 Người nhận", value=target_member.mention, inline=False)
 
-        # Kiểm tra có STK chưa (tạm để trống, Founder tự cập nhật sau)
-        bank_info = None  # TODO: lấy từ DB nếu có cột bank_account riêng cho từng nhân viên
+        bank_info = None
 
         if bank_info:
             embed.description = "Quét QR hoặc chuyển khoản theo thông tin bên dưới:"
@@ -444,7 +454,6 @@ class TipView(discord.ui.View):
                 f"{target_member.mention} chưa cập nhật thông tin nhận tip.\n"
                 "Founder/Admin sẽ liên hệ để hỗ trợ bạn tip trực tiếp nhé! 💖"
             )
-            # Báo cho admin biết khách muốn tip
             guild = interaction.guild or (target_member.guild if target_member else None)
             if guild:
                 log_ch = guild.get_channel(config.LOG_CHANNEL_ID)

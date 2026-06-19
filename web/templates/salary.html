@@ -19,7 +19,6 @@
         </thead>
         <tbody>
             {% for s in salary_data %}
-            {% if s.total_orders %}
             <tr class="border-b border-gray-800 hover:bg-gray-800/30">
                 {% if is_all %}
                 <td class="px-4 py-3 text-white font-medium">{{ s.display_name }}</td>
@@ -28,16 +27,17 @@
                 <td class="px-4 py-3">
                     {% if s.role_in_order == 'support' %}
                     <span class="px-2 py-0.5 rounded-full text-xs" style="background:#3498DB;color:white">Hỗ trợ (!order)</span>
-                    {% else %}
+                    {% elif s.role_in_order == 'admin' %}
                     <span class="px-2 py-0.5 rounded-full text-xs" style="background:#9B59B6;color:white">Xử lý (!done)</span>
+                    {% else %}
+                    <span class="px-2 py-0.5 rounded-full text-xs" style="background:#555;color:white">Chưa có đơn</span>
                     {% endif %}
                 </td>
-                <td class="px-4 py-3 text-yellow-300 font-bold">{{ s.total_orders }} đơn</td>
+                <td class="px-4 py-3 text-yellow-300 font-bold">{{ s.total_orders or 0 }} đơn</td>
                 <td class="px-4 py-3 text-green-400 font-bold">{{ "{:,.0f}".format(s.total_salary or 0).replace(",", ".") }} VNĐ</td>
             </tr>
-            {% endif %}
             {% else %}
-            <tr><td colspan="5" class="text-center py-8 text-gray-500">Chưa có dữ liệu lương</td></tr>
+            <tr><td colspan="5" class="text-center py-8 text-gray-500">Chưa có nhân viên nào</td></tr>
             {% endfor %}
         </tbody>
     </table>
