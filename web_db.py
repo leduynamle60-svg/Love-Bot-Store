@@ -45,16 +45,8 @@ def init_web_db():
         )
     """)
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS salary (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            web_user_id  INTEGER NOT NULL,
-            order_code   TEXT    NOT NULL UNIQUE,
-            amount       INTEGER DEFAULT 0,
-            note         TEXT,
-            created_at   TEXT    DEFAULT (datetime('now','localtime'))
-        )
-    """)
+    # Bảng salary được tạo ở database.py (init_db), không tạo lại ở đây
+    # để tránh xung đột schema (cột role_in_order)
 
     exists = c.execute("SELECT 1 FROM web_users WHERE role='founder'").fetchone()
     if not exists:
@@ -124,12 +116,13 @@ def get_all_salary():
     conn = get_conn()
     rows = conn.execute("""
         SELECT w.display_name, w.username, w.role,
+               s.role_in_order,
                COUNT(s.id) as total_orders,
                SUM(s.amount) as total_salary
         FROM web_users w
         LEFT JOIN salary s ON w.id = s.web_user_id
-        WHERE w.role IN ('support', 'admin')
-        GROUP BY w.id
+        WHERE w.role IN ('support', 'admin', 'founder')
+        GROUP BY w.id, s.role_in_order
         ORDER BY total_orders DESC
     """).fetchall()
     conn.close()
@@ -138,23 +131,24 @@ def get_all_salary():
 
 def get_salary_by_support(web_user_id):
     conn = get_conn()
-    row  = conn.execute("""
+    rows = conn.execute("""
         SELECT w.display_name, w.username,
+               s.role_in_order,
                COUNT(s.id) as total_orders,
                SUM(s.amount) as total_salary
         FROM web_users w
         LEFT JOIN salary s ON w.id = s.web_user_id
         WHERE w.id=?
-        GROUP BY w.id
-    """, (web_user_id,)).fetchone()
+        GROUP BY s.role_in_order
+    """, (web_user_id,)).fetchall()
     conn.close()
-    return row
+    return list(rows)
 
 
 def get_orders_by_support(web_user_id):
     conn = get_conn()
     rows = conn.execute("""
-        SELECT o.*, s.amount as commission
+        SELECT o.*, s.amount as commission, s.role_in_order
         FROM orders o
         JOIN salary s ON o.order_code = s.order_code
         WHERE s.web_user_id = ?
@@ -164,11 +158,11 @@ def get_orders_by_support(web_user_id):
     return list(rows)
 
 
-def add_salary_record(web_user_id, order_code, amount=0, note=""):
+def add_salary_record(web_user_id, order_code, amount=0, note="", role_in_order="support"):
     conn = get_conn()
     conn.execute(
-        "INSERT OR IGNORE INTO salary (web_user_id, order_code, amount, note) VALUES (?,?,?,?)",
-        (web_user_id, order_code, amount, note)
+        "INSERT OR IGNORE INTO salary (web_user_id, order_code, amount, note, role_in_order) VALUES (?,?,?,?,?)",
+        (web_user_id, order_code, amount, note, role_in_order)
     )
     conn.commit()
     conn.close()

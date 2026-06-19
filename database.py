@@ -82,6 +82,26 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS salary (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            web_user_id   INTEGER NOT NULL,
+            order_code    TEXT    NOT NULL,
+            amount        INTEGER DEFAULT 0,
+            note          TEXT,
+            role_in_order TEXT    DEFAULT 'support',
+            created_at    TEXT    DEFAULT (datetime('now','localtime')),
+            UNIQUE(web_user_id, order_code, role_in_order)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS order_support (
+            order_code          TEXT PRIMARY KEY,
+            support_discord_id  TEXT NOT NULL
+        )
+    """)
+
     conn.commit()
     conn.close()
     print("[DB] Database SQLite sẵn sàng ✅")

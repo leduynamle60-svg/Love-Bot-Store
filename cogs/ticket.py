@@ -20,6 +20,10 @@ def is_support_or_founder(member: discord.Member) -> bool:
     role_ids = {r.id for r in member.roles}
     return config.SUPPORT_ROLE_ID in role_ids or config.FOUNDER_ROLE_ID in role_ids
 
+def is_admin_or_founder(member: discord.Member) -> bool:
+    role_ids = {r.id for r in member.roles}
+    return config.ADMIN_ROLE_ID in role_ids or config.FOUNDER_ROLE_ID in role_ids
+
 
 class OpenTicketView(discord.ui.View):
     def __init__(self):

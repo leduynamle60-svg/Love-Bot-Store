@@ -252,10 +252,9 @@ def feedbacks():
 def salary():
     if session["role"] == "founder":
         data = wdb.get_all_salary()
-        return render_template("salary.html", salary_data=data, is_all=True)
     else:
         data = wdb.get_salary_by_support(session["user_id"])
-        return render_template("salary.html", salary_data=[data] if data else [], is_all=False)
+    return render_template("salary.html", salary_data=data, is_all=session["role"] == "founder")
 
 
 # ── Quản lý tài khoản ────────────────────────────────────────

@@ -10,7 +10,7 @@ import os
 
 import config
 import database as db
-from cogs.ticket import is_support_or_founder, FeedbackStarsView
+from cogs.ticket import is_support_or_founder, is_admin_or_founder, FeedbackStarsView
 
 
 def make_qr_url(amount: int, order_code: str) -> str:
@@ -34,7 +34,7 @@ class OrderCog(commands.Cog):
             channel.name.startswith("support-")
         )
 
-    # ── !order <tên sản phẩm> ────────────────────────────────
+# ── !order <tên sản phẩm> ────────────────────────────────
     @commands.command(name="order")
     async def cmd_order(self, ctx, *, product_name: str):
         try:
@@ -77,6 +77,16 @@ class OrderCog(commands.Cog):
 
             if order_code != "LBS-UNKNOWN":
                 db.update_order_status(order_code, "processing")
+
+            # ── Ghi nhận Support xử lý đơn (để tính lương khi !done) ──
+            if order_code != "LBS-UNKNOWN":
+                conn = db.get_conn()
+                conn.execute(
+                    "INSERT OR IGNORE INTO order_support (order_code, support_discord_id) VALUES (?, ?)",
+                    (order_code, str(ctx.author.id))
+                )
+                conn.commit()
+                conn.close()
 
             order_ch = ctx.guild.get_channel(config.ORDER_CHANNEL_ID)
             if not order_ch:
@@ -204,12 +214,12 @@ class OrderCog(commands.Cog):
             traceback.print_exc()
             await ctx.send(f"❌ Lỗi: `{e}`")
 
-    # ── !done ─────────────────────────────────────────────────
+# ── !done ─────────────────────────────────────────────────
     @commands.command(name="done")
     async def cmd_done(self, ctx):
         try:
-            if not is_support_or_founder(ctx.author):
-                return await ctx.send("❌ Chỉ Support/Founder mới dùng lệnh này!", delete_after=5)
+            if not is_admin_or_founder(ctx.author):
+                return await ctx.send("❌ Chỉ Admin/Founder mới được duyệt hoàn tất đơn!", delete_after=5)
 
             if not self._in_ticket(ctx.channel):
                 return await ctx.send("❌ Lệnh này chỉ dùng được trong ticket!", delete_after=5)
@@ -237,22 +247,48 @@ class OrderCog(commands.Cog):
             else:
                 order_code = "LBS-UNKNOWN"
 
+            product_name = order_info["product_name"] if order_info else "Không rõ"
+
+            # Tìm Support đã xử lý đơn (người dùng !order)
+            support_member = None
+            conn = db.get_conn()
+            support_row = conn.execute(
+                "SELECT support_discord_id FROM order_support WHERE order_code=?", (order_code,)
+            ).fetchone()
+            conn.close()
+            if support_row:
+                support_member = ctx.guild.get_member(int(support_row["support_discord_id"]))
+
             if order_info:
                 db.update_order_status(order_code, "done")
 
-                # Tính lương Support
+                # ── Tính lương cho cả 2: Support (!order) và Admin/Founder (!done) ──
                 import web_db as wdb
+                amt        = order_info["amount"]
+                commission = 5000 + (int(amt * 0.10) if amt >= 100000 else 0)
+
+                # Lương Admin/Founder (người dùng !done)
                 conn     = wdb.get_conn()
                 web_user = conn.execute(
                     "SELECT * FROM web_users WHERE discord_id=?", (str(ctx.author.id),)
                 ).fetchone()
                 conn.close()
-
                 if web_user:
-                    amt        = order_info["amount"]
-                    commission = 5000 if amt < 100000 else int(amt * 0.10)
-                    wdb.add_salary_record(web_user["id"], order_code, commission, f"Đơn {order_code} — {amt:,}đ")
-                    print(f"[Salary] {ctx.author} — {order_code} — +{commission:,}đ")
+                    wdb.add_salary_record(web_user["id"], order_code, commission,
+                                          f"Xử lý đơn {order_code} — {amt:,}đ", role_in_order="admin")
+                    print(f"[Salary-Admin] {ctx.author} — {order_code} — +{commission:,}đ")
+
+                # Lương Support (người dùng !order)
+                if support_row:
+                    conn = wdb.get_conn()
+                    support_web_user = conn.execute(
+                        "SELECT * FROM web_users WHERE discord_id=?", (support_row["support_discord_id"],)
+                    ).fetchone()
+                    conn.close()
+                    if support_web_user:
+                        wdb.add_salary_record(support_web_user["id"], order_code, commission,
+                                              f"Hỗ trợ đơn {order_code} — {amt:,}đ", role_in_order="support")
+                        print(f"[Salary-Support] {support_row['support_discord_id']} — {order_code} — +{commission:,}đ")
 
                 # Cập nhật embed trong #order
                 order_ch = ctx.guild.get_channel(config.ORDER_CHANNEL_ID)
@@ -276,7 +312,21 @@ class OrderCog(commands.Cog):
                                 await msg.edit(embed=new_embed)
                                 break
 
-            embed = discord.Embed(
+            # ── Embed thông tin đầy đủ trong ticket (KHÔNG xóa tin nhắn) ──
+            info_embed = discord.Embed(
+                title="✅ Đơn Hàng Hoàn Tất",
+                color=config.COLOR_SUCCESS,
+                timestamp=datetime.now()
+            )
+            info_embed.add_field(name="🛍️ Sản phẩm",         value=product_name, inline=False)
+            info_embed.add_field(name="👤 Người mua",         value=customer.mention if customer else "Unknown", inline=True)
+            info_embed.add_field(name="🎧 Nhân viên hỗ trợ",  value=support_member.mention if support_member else "Không rõ", inline=True)
+            info_embed.add_field(name="⚙️ Người xử lý đơn",   value=ctx.author.mention, inline=True)
+            info_embed.set_footer(text=config.BOT_FOOTER)
+            await ctx.send(embed=info_embed)
+
+            # ── Embed feedback cho khách trong ticket ──
+            fb_embed = discord.Embed(
                 title="🎉 Đơn hàng hoàn tất!",
                 description=(
                     f"{customer.mention if customer else 'Bạn'} ơi, đơn hàng của bạn đã được xử lý xong! 💖\n\n"
@@ -286,79 +336,52 @@ class OrderCog(commands.Cog):
                 color=config.COLOR_SUCCESS,
                 timestamp=datetime.now()
             )
-            embed.add_field(name="⭐ Chọn số sao bên dưới:", value="1 ⭐ → 5 ⭐⭐⭐⭐⭐", inline=False)
-            embed.set_footer(text=config.BOT_FOOTER)
+            fb_embed.add_field(name="⭐ Chọn số sao bên dưới:", value="1 ⭐ → 5 ⭐⭐⭐⭐⭐", inline=False)
+            fb_embed.set_footer(text=config.BOT_FOOTER)
 
             view = FeedbackStarsView(order_code, customer) if customer else None
             if view:
-                await ctx.send(embed=embed, view=view)
+                await ctx.send(embed=fb_embed, view=view)
             else:
-                embed.add_field(
+                fb_embed.add_field(
                     name="ℹ️ Lưu ý",
                     value="Không tìm thấy khách tự động. Dùng `!order` trước khi dùng `!done`.",
                     inline=False
                 )
-                await ctx.send(embed=embed)
+                await ctx.send(embed=fb_embed)
+
+            # ── Gửi DM cho khách kèm nút tip ──
+            if customer:
+                try:
+                    dm_embed = discord.Embed(
+                        title="🎉 Đơn Hàng Hoàn Tất!",
+                        description=(
+                            f"Cảm ơn bạn đã mua hàng tại **{config.BOT_NAME}**! 💖\n\n"
+                            "Đơn hàng của bạn đã được xử lý và giao thành công."
+                        ),
+                        color=config.COLOR_SUCCESS,
+                        timestamp=datetime.now()
+                    )
+                    dm_embed.add_field(name="🧾 Mã đơn",   value=f"`{order_code}`", inline=True)
+                    dm_embed.add_field(name="🛍️ Sản phẩm", value=product_name,      inline=True)
+                    dm_embed.add_field(
+                        name="💖 Cảm ơn bạn",
+                        value="Nếu bạn hài lòng với dịch vụ, hãy ủng hộ nhân viên đã hỗ trợ bạn bằng cách tip nhé!",
+                        inline=False
+                    )
+                    dm_embed.set_footer(text=config.BOT_FOOTER)
+
+                    tip_view = TipView(support_member, ctx.author)
+                    await customer.send(embed=dm_embed, view=tip_view)
+                except discord.Forbidden:
+                    print(f"[DM] Không gửi được DM cho {customer} (đã tắt DM)")
+
             await ctx.message.delete()
 
         except Exception as e:
             import traceback
             traceback.print_exc()
             await ctx.send(f"❌ Lỗi: `{e}`")
-
-    @commands.Cog.listener()
-    async def on_ready(self):
-        self.bot.loop.create_task(self._check_pending_updates())
-
-    async def _check_pending_updates(self):
-        import json, asyncio
-        await self.bot.wait_until_ready()
-        while not self.bot.is_closed():
-            try:
-                if os.path.exists("pending_updates.json"):
-                    with open("pending_updates.json", "r") as f:
-                        lines = f.readlines()
-
-                    if lines:
-                        # Xóa file trước
-                        os.remove("pending_updates.json")
-
-                        for line in lines:
-                            try:
-                                data       = json.loads(line.strip())
-                                order_code = data["order_code"]
-                                status_text = data["status_text"]
-                                color      = data["color"]
-
-                                guild    = self.bot.get_guild(config.GUILD_ID)
-                                order_ch = guild.get_channel(config.ORDER_CHANNEL_ID) if guild else None
-
-                                if order_ch:
-                                    async for msg in order_ch.history(limit=100):
-                                        if msg.author == guild.me and msg.embeds:
-                                            found = any(order_code in (f.value or "") for f in msg.embeds[0].fields)
-                                            if found:
-                                                old_embed = msg.embeds[0]
-                                                new_embed = discord.Embed(
-                                                    title=old_embed.title,
-                                                    color=color,
-                                                    timestamp=msg.created_at
-                                                )
-                                                for f in old_embed.fields:
-                                                    if f.name == "📌 Trạng thái":
-                                                        new_embed.add_field(name="📌 Trạng thái", value=status_text, inline=f.inline)
-                                                    else:
-                                                        new_embed.add_field(name=f.name, value=f.value, inline=f.inline)
-                                                new_embed.set_footer(text=config.BOT_FOOTER)
-                                                await msg.edit(embed=new_embed)
-                                                print(f"[Web→Discord] Đã cập nhật {order_code} → {status_text}")
-                                                break
-                            except Exception as e:
-                                print(f"[Web→Discord ERROR] {e}")
-            except Exception as e:
-                print(f"[PendingUpdate ERROR] {e}")
-
-            await asyncio.sleep(3)  # Check mỗi 3 giây
 
     # ── Error handlers ────────────────────────────────────────
     @cmd_order.error
@@ -372,6 +395,68 @@ class OrderCog(commands.Cog):
             await ctx.send("❌ Số tiền không hợp lệ!\nCú pháp: `!qr <số tiền>` (VD: `!qr 50000`)", delete_after=8)
         elif isinstance(error, commands.MissingRequiredArgument):
             await ctx.send("❌ Thiếu số tiền!\nCú pháp: `!qr <số tiền>`", delete_after=8)
+
+
+class TipView(discord.ui.View):
+    """View DM khách — 2 nút tip cho support và người xử lý"""
+
+    def __init__(self, support_member: discord.Member, processor_member: discord.Member):
+        super().__init__(timeout=None)
+        self.support_member   = support_member
+        self.processor_member = processor_member
+
+    @discord.ui.button(label="💝 Tip Nhân Viên Hỗ Trợ", style=discord.ButtonStyle.success, custom_id="tip_support")
+    async def tip_support(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_tip(interaction, self.support_member, "Nhân viên hỗ trợ")
+
+    @discord.ui.button(label="💝 Tip Người Xử Lý Đơn", style=discord.ButtonStyle.success, custom_id="tip_processor")
+    async def tip_processor(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_tip(interaction, self.processor_member, "Người xử lý đơn")
+
+    async def _handle_tip(self, interaction: discord.Interaction, target_member, role_label: str):
+        if not target_member:
+            return await interaction.response.send_message(
+                f"❌ Không tìm thấy thông tin {role_label.lower()}!", ephemeral=True
+            )
+
+        # Lấy STK từ web_users (nếu Founder đã cập nhật)
+        import web_db as wdb
+        conn = wdb.get_conn()
+        web_user = conn.execute(
+            "SELECT * FROM web_users WHERE discord_id=?", (str(target_member.id),)
+        ).fetchone()
+        conn.close()
+
+        embed = discord.Embed(
+            title=f"💝 Tip cho {role_label}",
+            color=config.COLOR_PRIMARY
+        )
+        embed.add_field(name="👤 Người nhận", value=target_member.mention, inline=False)
+
+        # Kiểm tra có STK chưa (tạm để trống, Founder tự cập nhật sau)
+        bank_info = None  # TODO: lấy từ DB nếu có cột bank_account riêng cho từng nhân viên
+
+        if bank_info:
+            embed.description = "Quét QR hoặc chuyển khoản theo thông tin bên dưới:"
+            embed.add_field(name="🏦 STK", value=bank_info, inline=False)
+        else:
+            embed.description = (
+                f"{target_member.mention} chưa cập nhật thông tin nhận tip.\n"
+                "Founder/Admin sẽ liên hệ để hỗ trợ bạn tip trực tiếp nhé! 💖"
+            )
+            # Báo cho admin biết khách muốn tip
+            guild = interaction.guild or (target_member.guild if target_member else None)
+            if guild:
+                log_ch = guild.get_channel(config.LOG_CHANNEL_ID)
+                if log_ch:
+                    await log_ch.send(
+                        embed=discord.Embed(
+                            description=f"💝 **{interaction.user}** muốn tip cho **{target_member.mention}** ({role_label})",
+                            color=config.COLOR_WARNING
+                        )
+                    )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 async def setup(bot):
