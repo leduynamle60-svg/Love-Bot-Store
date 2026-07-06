@@ -36,6 +36,14 @@ intents.guilds          = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
+async def setup_hook():
+    await load_cogs()
+
+    synced = await bot.tree.sync()
+    print(f"[Slash] ✅ Đã sync {len(synced)} slash commands")
+
+bot.setup_hook = setup_hook
+
 
 # ── Events ────────────────────────────────────────────────────
 @bot.event
@@ -85,7 +93,7 @@ async def on_command_error(ctx, error):
 
 # ── Load Cogs ─────────────────────────────────────────────────
 async def load_cogs():
-    cogs = ["cogs.ticket", "cogs.order", "cogs.admin", "cogs.welcome"]
+    cogs = ["cogs.ticket", "cogs.order", "cogs.admin", "cogs.welcome", "cogs.slash"]
     for cog in cogs:
         try:
             await bot.load_extension(cog)
@@ -103,7 +111,6 @@ async def main():
     start_web_thread()
 
     async with bot:
-        await load_cogs()
         await bot.start(config.BOT_TOKEN)
 
 
