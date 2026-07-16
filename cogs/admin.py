@@ -33,7 +33,7 @@ class AdminCog(commands.Cog):
                 "`!qr <số tiền>` — Tạo QR thanh toán tự động\n"
                 "`!done` — Hoàn tất đơn, gửi feedback cho khách\n"
                 "`!cancel` — Hủy đơn\n"
-                "`!check3m` — Link check điều kiện Nicho Trail\n"
+                "`!checkntrail` — Link check điều kiện Nicho Trail\n"
                 "`!web` — Hiện link truy cập web dashboard\n"
             ),
             inline=False
@@ -117,9 +117,9 @@ class AdminCog(commands.Cog):
         embed.set_footer(text=config.BOT_FOOTER)
         await ctx.send(embed=embed)
 
-    @commands.command(name="checknt")
+    @commands.command(name="checkntrail")
     async def cmd_check(self, ctx):
-        """!check — Hiện link check điều kiện Nicho Trail"""
+        """!checkntrail — Hiện link check điều kiện Nicho Trail"""
         embed = discord.Embed(
             title="🔍 Check Điều Kiện Nicho Trail",
             description=(

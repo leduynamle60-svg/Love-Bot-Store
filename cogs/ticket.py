@@ -349,7 +349,7 @@ class CloseTicketView(discord.ui.View):
 
 class FeedbackStarsView(discord.ui.View):
     def __init__(self, order_code: str, customer: discord.Member):
-        super().__init__(timeout=300)
+        super().__init__(timeout=259200)
         self.order_code = order_code
         self.customer = customer
 
