@@ -8,22 +8,58 @@
 </div>
 
 <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-    <!-- Thông tin đơn -->
     <div class="card p-6 space-y-4">
-        <h2 class="text-lg font-bold text-white border-b border-gray-700 pb-2">📋 Thông tin đơn hàng</h2>
+        <h2 class="text-lg font-bold text-white border-b border-gray-700 pb-2">
+            📋 Thông tin đơn hàng
+        </h2>
+
         <div class="grid grid-cols-2 gap-3 text-sm">
             <div class="text-gray-400">Mã đơn</div>
             <div class="text-pink-400 font-mono">{{ order.order_code }}</div>
+
+            <div class="text-gray-400">Mã ticket</div>
+            <div class="text-white font-mono">{{ order.ticket_number or '—' }}</div>
+
             <div class="text-gray-400">Khách hàng</div>
             <div class="text-white">{{ order.username }}</div>
+
+            <div class="text-gray-400">Discord ID khách</div>
+            <div class="text-gray-300 font-mono">{{ order.user_id }}</div>
+
             <div class="text-gray-400">Sản phẩm</div>
             <div class="text-white">{{ order.product_name }}</div>
+
+            <div class="text-gray-400">Người nhận đơn </div>
+            <div class="text-white">
+                {{ order.support_name or '—' }}
+                {% if order.support_discord_id %}
+                <div class="text-xs text-gray-500 font-mono">{{ order.support_discord_id }}</div>
+                {% endif %}
+            </div>
+
+            <div class="text-gray-400">Người xử lý </div>
+            <div class="text-white">
+                {{ order.processor_name or '—' }}
+                {% if order.processor_discord_id %}
+                <div class="text-xs text-gray-500 font-mono">{{ order.processor_discord_id }}</div>
+                {% endif %}
+            </div>
+
             <div class="text-gray-400">Số tiền</div>
-            <div class="text-white font-bold">{{ "{:,.0f}".format(order.amount).replace(",", ".") }} VNĐ</div>
+            <div class="text-white font-bold">
+                {{ "{:,.0f}".format(order.amount or 0).replace(",", ".") }} VNĐ
+            </div>
+
             <div class="text-gray-400">Trạng thái</div>
-            <div><span class="px-2 py-0.5 rounded-full text-xs text-white status-{{ order.status }}">{{ order.status }}</span></div>
+            <div>
+                <span class="px-2 py-0.5 rounded-full text-xs text-white status-{{ order.status }}">
+                    {{ order.status }}
+                </span>
+            </div>
+
             <div class="text-gray-400">Tạo lúc</div>
             <div class="text-gray-300">{{ order.created_at }}</div>
+
             {% if order.paid_at %}
             <div class="text-gray-400">Thanh toán lúc</div>
             <div class="text-gray-300">{{ order.paid_at }}</div>
@@ -31,42 +67,85 @@
         </div>
     </div>
 
-    <!-- Actions (Founder only) -->
-    {% if session.role == 'founder' %}
+    {% if session.role in ['founder', 'admin'] %}
     <div class="space-y-4">
+        <a href="/orders/{{ order.order_code }}/edit"
+           class="btn-primary block text-center">
+            <i class="fa fa-pen mr-2"></i>Chỉnh sửa toàn bộ đơn
+        </a>
+
+        <form method="POST"
+              action="/orders/{{ order.order_code }}/send-discord"
+              onsubmit="return confirm('Gửi lại đơn này vào kênh #order?')">
+            <button type="submit"
+                    class="w-full rounded-lg px-4 py-3 font-semibold text-white bg-indigo-600 hover:bg-indigo-500 transition">
+                <i class="fa fa-paper-plane mr-2"></i>
+                Gửi lại đơn vào #order
+            </button>
+        </form>
+
         <div class="card p-6">
-            <h2 class="text-lg font-bold text-white border-b border-gray-700 pb-2 mb-4">⚙️ Cập nhật trạng thái</h2>
-            <form method="POST" action="/orders/{{ order.order_code }}/update" class="space-y-3">
+            <h2 class="text-lg font-bold text-white border-b border-gray-700 pb-2 mb-4">
+                ⚙️ Cập nhật trạng thái
+            </h2>
+
+            <form method="POST"
+                  action="/orders/{{ order.order_code }}/update"
+                  class="space-y-3">
                 <select name="status" class="w-full">
-                    <option value="pending"    {{ 'selected' if order.status == 'pending' }}>Đang chờ</option>
+                    <option value="pending" {{ 'selected' if order.status == 'pending' }}>Đang chờ</option>
                     <option value="processing" {{ 'selected' if order.status == 'processing' }}>Đang xử lý</option>
-                    <option value="paid"       {{ 'selected' if order.status == 'paid' }}>Đã thanh toán</option>
-                    <option value="done"       {{ 'selected' if order.status == 'done' }}>Hoàn tất</option>
-                    <option value="cancelled"  {{ 'selected' if order.status == 'cancelled' }}>Đã hủy</option>
+                    <option value="paid" {{ 'selected' if order.status == 'paid' }}>Đã thanh toán</option>
+                    <option value="done" {{ 'selected' if order.status == 'done' }}>Hoàn tất</option>
+                    <option value="cancelled" {{ 'selected' if order.status == 'cancelled' }}>Đã hủy</option>
                 </select>
-                <button type="submit" class="btn-primary w-full">Cập nhật</button>
+
+                <button type="submit" class="btn-primary w-full">
+                    Cập nhật
+                </button>
             </form>
         </div>
+
+        {% if session.role == 'founder' %}
         <div class="card p-6">
-            <h2 class="text-lg font-bold text-red-400 border-b border-gray-700 pb-2 mb-4">🗑️ Xóa đơn hàng</h2>
-            <p class="text-gray-400 text-sm mb-3">Hành động này không thể hoàn tác!</p>
-            <form method="POST" action="/orders/{{ order.order_code }}/delete" onsubmit="return confirm('Chắc chắn xóa đơn này?')">
-                <button type="submit" class="btn-danger w-full">Xóa đơn hàng</button>
+            <h2 class="text-lg font-bold text-red-400 border-b border-gray-700 pb-2 mb-4">
+                🗑️ Xóa đơn hàng
+            </h2>
+
+            <p class="text-gray-400 text-sm mb-3">
+                Hành động này không thể hoàn tác!
+            </p>
+
+            <form method="POST"
+                  action="/orders/{{ order.order_code }}/delete"
+                  onsubmit="return confirm('Chắc chắn xóa đơn này?')">
+                <button type="submit" class="btn-danger w-full">
+                    Xóa đơn hàng
+                </button>
             </form>
         </div>
+        {% endif %}
     </div>
     {% endif %}
 </div>
 
-<!-- Feedback -->
 {% if feedback %}
 <div class="card p-6 mt-6">
-    <h2 class="text-lg font-bold text-white border-b border-gray-700 pb-2 mb-4">💬 Feedback</h2>
+    <h2 class="text-lg font-bold text-white border-b border-gray-700 pb-2 mb-4">
+        💬 Feedback
+    </h2>
+
     <div class="grid grid-cols-2 gap-3 text-sm">
         <div class="text-gray-400">Đánh giá</div>
-        <div class="text-yellow-300">{{ '⭐' * feedback.stars }}{{ '✩' * (5 - feedback.stars) }}</div>
+        <div class="text-yellow-300">
+            {{ '⭐' * feedback.stars }}{{ '✩' * (5 - feedback.stars) }}
+        </div>
+
         <div class="text-gray-400">Nhận xét</div>
-        <div class="text-white">{{ feedback.content or 'Không có nhận xét' }}</div>
+        <div class="text-white">
+            {{ feedback.content or 'Không có nhận xét' }}
+        </div>
+
         <div class="text-gray-400">Thời gian</div>
         <div class="text-gray-300">{{ feedback.created_at }}</div>
     </div>

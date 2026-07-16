@@ -7,6 +7,7 @@
         <h1 class="text-2xl font-bold text-white">📦 Đơn hàng</h1>
         <p class="text-gray-400">Quản lý tất cả đơn hàng</p>
     </div>
+    <a href="/orders/create" class="btn-primary"><i class="fa fa-plus mr-2"></i>Thêm đơn thủ công</a>
 </div>
 
 <!-- Filter -->
@@ -34,6 +35,7 @@
                 <th class="px-4 py-3 text-left">Mã đơn</th>
                 <th class="px-4 py-3 text-left">Khách hàng</th>
                 <th class="px-4 py-3 text-left">Sản phẩm</th>
+                <th class="px-4 py-3 text-left">Ticket</th>
                 <th class="px-4 py-3 text-left">Số tiền</th>
                 <th class="px-4 py-3 text-left">Trạng thái</th>
                 <th class="px-4 py-3 text-left">Thời gian</th>
@@ -46,6 +48,7 @@
                 <td class="px-4 py-3 font-mono text-pink-400">{{ o.order_code }}</td>
                 <td class="px-4 py-3 text-gray-300">{{ o.username }}</td>
                 <td class="px-4 py-3 text-gray-300">{{ o.product_name }}</td>
+                <td class="px-4 py-3 text-gray-400 font-mono">{{ o.ticket_number or '—' }}</td>
                 <td class="px-4 py-3 text-white">{{ "{:,.0f}".format(o.amount).replace(",", ".") }} ₫</td>
                 <td class="px-4 py-3">
                     <span class="px-2 py-0.5 rounded-full text-xs text-white status-{{ o.status }}">{{ o.status }}</span>
@@ -56,7 +59,7 @@
                 </td>
             </tr>
             {% else %}
-            <tr><td colspan="7" class="text-center py-8 text-gray-500">Không có đơn hàng nào</td></tr>
+            <tr><td colspan="8" class="text-center py-8 text-gray-500">Không có đơn hàng nào</td></tr>
             {% endfor %}
         </tbody>
     </table>

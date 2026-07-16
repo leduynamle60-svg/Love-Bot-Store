@@ -117,7 +117,7 @@ class AdminCog(commands.Cog):
         embed.set_footer(text=config.BOT_FOOTER)
         await ctx.send(embed=embed)
 
-    @commands.command(name="check3m")
+    @commands.command(name="checknt")
     async def cmd_check(self, ctx):
         """!check — Hiện link check điều kiện Nicho Trail"""
         embed = discord.Embed(

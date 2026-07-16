@@ -1,40 +1,107 @@
 """
 cogs/slash.py — Slash commands cho Love Bot Store
 """
+import urllib.parse
+from datetime import datetime
 
 import discord
-from discord.ext import commands
 from discord import app_commands
-from datetime import datetime
-import calendar
+from discord.ext import commands
 
 import config
 import database as db
+
+
+
+def has_ticket_manage_permission(member: discord.Member) -> bool:
+    role_ids = {role.id for role in member.roles}
+    return (
+        config.SUPPORT_ROLE_ID in role_ids
+        or config.ADMIN_ROLE_ID in role_ids
+        or config.FOUNDER_ROLE_ID in role_ids
+        or member.guild_permissions.administrator
+    )
+
+
+def has_admin_ticket_permission(member: discord.Member) -> bool:
+    role_ids = {role.id for role in member.roles}
+    return (
+        config.ADMIN_ROLE_ID in role_ids
+        or config.FOUNDER_ROLE_ID in role_ids
+        or member.guild_permissions.administrator
+    )
+
+
+def ticket_number_from_channel(channel: discord.TextChannel) -> str:
+    name = channel.name
+    parts = name.rsplit("-", 1)
+    if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) == 4:
+        return parts[1]
+    return "—"
+
+
+BANK_BINS = {
+    "MB Bank": "970422",
+    "VPBank": "970432",
+    "Vietcombank": "970436",
+    "Techcombank": "970407",
+    "ACB": "970416",
+    "BIDV": "970418",
+    "VietinBank": "970415",
+    "Sacombank": "970403",
+    "TPBank": "970423",
+    "VIB": "970441",
+    "SHB": "970443",
+    "MSB": "970426",
+    "OCB": "970448",
+    "SeABank": "970440",
+    "Eximbank": "970431",
+    "HDBank": "970437",
+    "Agribank": "970405",
+    "Nam A Bank": "970428",
+    "PVcomBank": "970412",
+    "Bac A Bank": "970409",
+    "VietBank": "970433",
+    "BaoViet Bank": "970438",
+    "NCB": "970419",
+    "KienlongBank": "970452",
+    "ABBank": "970425",
+}
 
 
 class SlashCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="bxh", description="🏆 Bảng xếp hạng người mua trong tháng")
+    @app_commands.command(
+        name="bxh",
+        description="🏆 Bảng xếp hạng người mua trong tháng"
+    )
     async def bxh(self, interaction: discord.Interaction):
-        now   = datetime.now()
+        now = datetime.now()
         month = now.month
-        year  = now.year
+        year = now.year
 
-        conn = db.get_conn()
-        rows = conn.execute("""
-            SELECT user_id, username,
-                   COUNT(*) as total_orders,
-                   SUM(amount) as total_spent
+        conn = db.get_conn_dict()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                user_id,
+                username,
+                COUNT(*) AS total_orders,
+                COALESCE(SUM(amount), 0) AS total_spent
             FROM orders
             WHERE status IN ('paid', 'done')
-            AND strftime('%m', created_at) = ?
-            AND strftime('%Y', created_at) = ?
-            GROUP BY user_id
+              AND EXTRACT(MONTH FROM created_at)=%s
+              AND EXTRACT(YEAR FROM created_at)=%s
+            GROUP BY user_id, username
             ORDER BY total_spent DESC
             LIMIT 10
-        """, (f"{month:02d}", str(year))).fetchall()
+            """,
+            (month, year)
+        )
+        rows = cur.fetchall()
         conn.close()
 
         embed = discord.Embed(
@@ -47,27 +114,41 @@ class SlashCog(commands.Cog):
             embed.description = "Chưa có đơn hàng nào trong tháng này!"
         else:
             medals = ["🥇", "🥈", "🥉"]
-            desc   = ""
-            for i, row in enumerate(rows):
-                medal    = medals[i] if i < 3 else f"`#{i+1}`"
-                member   = interaction.guild.get_member(row["user_id"])
-                name     = member.display_name if member else row["username"]
-                spent    = f"{row['total_spent']:,}".replace(",", ".")
-                desc    += f"{medal} **{name}** — {row['total_orders']} đơn — {spent} VNĐ\n"
-            embed.description = desc
+            lines = []
+
+            for index, row in enumerate(rows):
+                medal = medals[index] if index < 3 else f"`#{index + 1}`"
+                member = interaction.guild.get_member(row["user_id"])
+                name = member.display_name if member else row["username"]
+                spent = f"{row['total_spent']:,}".replace(",", ".")
+                lines.append(
+                    f"{medal} **{name}** — "
+                    f"{row['total_orders']} đơn — {spent} VNĐ"
+                )
+
+            embed.description = "\n".join(lines)
 
         embed.set_footer(text=config.BOT_FOOTER)
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(name="myorders", description="📦 Xem lịch sử đơn hàng của bạn")
+    @app_commands.command(
+        name="myorders",
+        description="📦 Xem lịch sử đơn hàng của bạn"
+    )
     async def myorders(self, interaction: discord.Interaction):
-        conn = db.get_conn()
-        rows = conn.execute("""
-            SELECT * FROM orders
-            WHERE user_id = ?
+        conn = db.get_conn_dict()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT *
+            FROM orders
+            WHERE user_id=%s
             ORDER BY created_at DESC
             LIMIT 5
-        """, (interaction.user.id,)).fetchall()
+            """,
+            (interaction.user.id,)
+        )
+        rows = cur.fetchall()
         conn.close()
 
         embed = discord.Embed(
@@ -80,17 +161,19 @@ class SlashCog(commands.Cog):
             embed.description = "Bạn chưa có đơn hàng nào!"
         else:
             status_map = {
-                "pending":    "⏳ Đang chờ",
+                "pending": "⏳ Đang chờ",
                 "processing": "🔄 Đang xử lý",
-                "paid":       "💳 Đã thanh toán",
-                "done":       "✅ Hoàn tất",
-                "cancelled":  "❌ Đã hủy",
+                "paid": "💳 Đã thanh toán",
+                "done": "✅ Hoàn tất",
+                "cancelled": "❌ Đã hủy",
             }
+
             for row in rows:
+                amount = f"{row['amount']:,}".replace(",", ".")
                 embed.add_field(
                     name=f"`{row['order_code']}` — {row['product_name']}",
                     value=(
-                        f"💰 {row['amount']:,} VNĐ".replace(",", ".") + "\n"
+                        f"💰 {amount} VNĐ\n"
                         f"📌 {status_map.get(row['status'], row['status'])}\n"
                         f"🕐 {row['created_at']}"
                     ),
@@ -98,7 +181,911 @@ class SlashCog(commands.Cog):
                 )
 
         embed.set_footer(text=config.BOT_FOOTER)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True
+        )
+
+    @app_commands.command(
+        name="checkticket",
+        description="🎫 Xem tất cả ticket đang mở và tự dọn ticket rác"
+    )
+    async def checkticket(self, interaction: discord.Interaction):
+        if not has_ticket_manage_permission(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Chỉ Support/Admin/Founder mới dùng được lệnh này!",
+                ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+
+        rows = db.get_all_open_tickets()
+        active = []
+        stale_count = 0
+
+        for row in rows:
+            channel = interaction.guild.get_channel(row["channel_id"])
+
+            if channel is None:
+                db.close_ticket(row["channel_id"])
+                stale_count += 1
+                continue
+
+            member = interaction.guild.get_member(row["user_id"])
+            status = row["status"] or "pending"
+
+            status_map = {
+                "pending": "⏳ Đang chờ",
+                "processing": "🔄 Đang xử lý",
+                "paid": "💳 Đã thanh toán",
+                "done": "✅ Hoàn tất — nên đóng",
+                "cancelled": "❌ Đã hủy — nên đóng",
+            }
+
+            active.append(
+                {
+                    "row": row,
+                    "channel": channel,
+                    "member": member,
+                    "status_text": status_map.get(status, status),
+                }
+            )
+
+        embed = discord.Embed(
+            title="🎫 Danh sách ticket đang mở",
+            color=config.COLOR_INFO,
+            timestamp=datetime.now()
+        )
+
+        if not active:
+            embed.description = "Hiện không còn ticket nào đang mở."
+            if stale_count:
+                embed.description += (
+                    f"\n\n🧹 Đã tự dọn **{stale_count} ticket rác**."
+                )
+        else:
+            embed.description = f"Đang có **{len(active)} ticket** còn hoạt động."
+            if stale_count:
+                embed.description += (
+                    f"\n🧹 Đã tự dọn **{stale_count} ticket rác**."
+                )
+
+            for item in active[:25]:
+                row = item["row"]
+                channel = item["channel"]
+                member = item["member"]
+
+                customer = (
+                    member.mention
+                    if member
+                    else f"`{row['user_id']}`"
+                )
+
+                ticket_number = (
+                    row["ticket_number"]
+                    or ticket_number_from_channel(channel)
+                )
+
+                # Ticket hỗ trợ không có đơn hàng và không cần hiển thị
+                # mã đơn/sản phẩm.
+                is_support_ticket = channel.name.startswith("support-")
+
+                if is_support_ticket:
+                    field_value = (
+                        f"🎟️ Mã ticket: `{ticket_number}`\n"
+                        f"👤 Khách: {customer}\n"
+                        f"📍 Loại: **Hỗ trợ**\n"
+                        f"📌 Trạng thái: **⏳ Đang chờ hỗ trợ**\n"
+                        f"🔗 {channel.mention}"
+                    )
+                else:
+                    order_code = row["order_code"] or "Chưa có"
+                    product = row["product_name"] or "Chưa order"
+
+                    field_value = (
+                        f"🎟️ Mã ticket: `{ticket_number}`\n"
+                        f"👤 Khách: {customer}\n"
+                        f"📍 Loại: **Mua hàng**\n"
+                        f"🧾 Mã đơn: `{order_code}`\n"
+                        f"🛍️ Sản phẩm: `{product}`\n"
+                        f"📌 Trạng thái: **{item['status_text']}**\n"
+                        f"🔗 {channel.mention}"
+                    )
+
+                embed.add_field(
+                    name=f"#{channel.name}",
+                    value=field_value,
+                    inline=False
+                )
+
+            if len(active) > 25:
+                embed.set_footer(
+                    text=f"Chỉ hiển thị 25/{len(active)} ticket"
+                )
+            else:
+                embed.set_footer(text=config.BOT_FOOTER)
+
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True
+        )
+
+    @app_commands.command(
+        name="ticketinfo",
+        description="🔎 Xem chi tiết ticket theo mã 4 số"
+    )
+    @app_commands.describe(ticket_number="Mã ticket 4 số, ví dụ 3591")
+    async def ticketinfo(
+        self,
+        interaction: discord.Interaction,
+        ticket_number: str
+    ):
+        if not has_ticket_manage_permission(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Chỉ Support/Admin/Founder mới dùng được lệnh này!",
+                ephemeral=True
+            )
+
+        ticket_number = ticket_number.strip()
+
+        if not ticket_number.isdigit() or len(ticket_number) != 4:
+            return await interaction.response.send_message(
+                "❌ Mã ticket phải gồm đúng 4 chữ số!",
+                ephemeral=True
+            )
+
+        target_channel = None
+
+        for channel in interaction.guild.text_channels:
+            if channel.name.endswith(f"-{ticket_number}"):
+                target_channel = channel
+                break
+
+        if target_channel is None:
+            return await interaction.response.send_message(
+                f"❌ Không tìm thấy kênh ticket có mã `{ticket_number}`.",
+                ephemeral=True
+            )
+
+        ticket_row = db.get_ticket_by_channel(target_channel.id)
+        order = db.get_order_by_channel_any(target_channel.id)
+
+        if not ticket_row and not order:
+            return await interaction.response.send_message(
+                "⚠️ Kênh tồn tại nhưng không tìm thấy dữ liệu trong database.",
+                ephemeral=True
+            )
+
+        user_id = (
+            ticket_row["user_id"]
+            if ticket_row
+            else order["user_id"]
+        )
+        member = interaction.guild.get_member(user_id)
+
+        order_code = (
+            order["order_code"]
+            if order
+            else ticket_row["order_code"]
+        )
+        product = order["product_name"] if order else "Chưa order"
+        status = order["status"] if order else "pending"
+
+        status_map = {
+            "pending": "⏳ Đang chờ",
+            "processing": "🔄 Đang xử lý",
+            "paid": "💳 Đã thanh toán",
+            "done": "✅ Hoàn tất",
+            "cancelled": "❌ Đã hủy",
+        }
+
+        embed = discord.Embed(
+            title=f"🔎 Ticket #{ticket_number}",
+            color=config.COLOR_INFO,
+            timestamp=datetime.now()
+        )
+        embed.add_field(
+            name="📁 Kênh",
+            value=target_channel.mention,
+            inline=False
+        )
+        embed.add_field(
+            name="👤 Khách",
+            value=member.mention if member else f"`{user_id}`",
+            inline=True
+        )
+        embed.add_field(
+            name="🧾 Mã đơn",
+            value=f"`{order_code or 'Chưa có'}`",
+            inline=True
+        )
+        embed.add_field(
+            name="🛍️ Sản phẩm",
+            value=product,
+            inline=False
+        )
+        embed.add_field(
+            name="📌 Trạng thái",
+            value=status_map.get(status, status),
+            inline=True
+        )
+
+        if order:
+            embed.add_field(
+                name="🎧 Người nhận đơn",
+                value=order["support_name"] or "—",
+                inline=True
+            )
+            embed.add_field(
+                name="⚙️ Người xử lý",
+                value=order["processor_name"] or "—",
+                inline=True
+            )
+
+        embed.set_footer(text=config.BOT_FOOTER)
+
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True
+        )
+
+    @app_commands.command(
+        name="clearticket",
+        description="🧹 Xóa dữ liệu ticket bị kẹt của một thành viên"
+    )
+    @app_commands.describe(member="Người đang bị báo còn ticket")
+    async def clearticket(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member
+    ):
+        if not has_admin_ticket_permission(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Chỉ Admin/Founder mới dùng được lệnh này!",
+                ephemeral=True
+            )
+
+        deleted = db.clear_tickets_by_user(member.id)
+
+        await interaction.response.send_message(
+            (
+                f"✅ Đã xóa **{deleted} dữ liệu ticket** của "
+                f"{member.mention}.\n"
+                "Người đó có thể tạo ticket mới."
+            ),
+            ephemeral=True
+        )
+
+    @app_commands.command(
+        name="closeticket",
+        description="🔒 Đóng và xóa ticket theo mã 4 số"
+    )
+    @app_commands.describe(ticket_number="Mã ticket 4 số, ví dụ 3591")
+    async def closeticket(
+        self,
+        interaction: discord.Interaction,
+        ticket_number: str
+    ):
+        if not has_admin_ticket_permission(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Chỉ Admin/Founder mới dùng được lệnh này!",
+                ephemeral=True
+            )
+
+        ticket_number = ticket_number.strip()
+
+        if not ticket_number.isdigit() or len(ticket_number) != 4:
+            return await interaction.response.send_message(
+                "❌ Mã ticket phải gồm đúng 4 chữ số!",
+                ephemeral=True
+            )
+
+        target_channel = None
+
+        for channel in interaction.guild.text_channels:
+            if channel.name.endswith(f"-{ticket_number}"):
+                target_channel = channel
+                break
+
+        if target_channel is None:
+            return await interaction.response.send_message(
+                f"❌ Không tìm thấy ticket có mã `{ticket_number}`.",
+                ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+
+        db.close_ticket(target_channel.id)
+
+        channel_name = target_channel.name
+
+        await interaction.followup.send(
+            f"✅ Đang đóng `#{channel_name}`...",
+            ephemeral=True
+        )
+
+        try:
+            await target_channel.send(
+                f"🔒 Ticket được đóng từ xa bởi {interaction.user.mention}."
+            )
+        except discord.HTTPException:
+            pass
+
+        await target_channel.delete(
+            reason=f"Đóng từ xa bởi {interaction.user}"
+        )
+
+
+
+    @app_commands.command(
+        name="addroleticket",
+        description="➕ Cho phép một role truy cập ticket hiện tại"
+    )
+    @app_commands.describe(
+        role="Role cần thêm quyền xem và nhắn trong ticket"
+    )
+    async def addroleticket(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role
+    ):
+        if not has_ticket_manage_permission(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Chỉ Support/Admin/Founder mới dùng được lệnh này!",
+                ephemeral=True
+            )
+
+        channel = interaction.channel
+
+        if not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message(
+                "❌ Lệnh này chỉ dùng được trong kênh ticket!",
+                ephemeral=True
+            )
+
+        # Chỉ cho dùng trong kênh có dữ liệu ticket/order.
+        try:
+            is_ticket = bool(
+                db.get_ticket_by_channel(channel.id)
+                or db.get_order_by_channel_any(channel.id)
+            )
+        except Exception:
+            is_ticket = False
+
+        if not is_ticket:
+            return await interaction.response.send_message(
+                "❌ Kênh này không phải ticket đang được hệ thống quản lý!",
+                ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            await channel.set_permissions(
+                role,
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True,
+                reason=f"Thêm role vào ticket bởi {interaction.user}"
+            )
+
+            await interaction.followup.send(
+                f"✅ Đã cho role {role.mention} truy cập {channel.mention}.",
+                ephemeral=True
+            )
+
+            try:
+                await channel.send(
+                    f"➕ {interaction.user.mention} đã thêm {role.mention} vào ticket."
+                )
+            except discord.HTTPException:
+                pass
+
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ Bot thiếu quyền **Manage Channels / Quản lý kênh**!",
+                ephemeral=True
+            )
+        except Exception as error:
+            import traceback
+            traceback.print_exc()
+            await interaction.followup.send(
+                f"❌ Lỗi `/addroleticket`: `{type(error).__name__}: {error}`",
+                ephemeral=True
+            )
+
+    @app_commands.command(
+        name="addbank",
+        description="🏦 Lưu hoặc cập nhật thông tin ngân hàng của bạn"
+    )
+    @app_commands.describe(
+        bank_name="Chọn ngân hàng",
+        account_number="Số tài khoản",
+        account_name="Tên chủ tài khoản"
+    )
+    @app_commands.choices(
+        bank_name=[
+            app_commands.Choice(name="MB Bank", value="MB Bank"),
+            app_commands.Choice(name="VPBank", value="VPBank"),
+            app_commands.Choice(name="Vietcombank", value="Vietcombank"),
+            app_commands.Choice(name="Techcombank", value="Techcombank"),
+            app_commands.Choice(name="ACB", value="ACB"),
+            app_commands.Choice(name="BIDV", value="BIDV"),
+            app_commands.Choice(name="VietinBank", value="VietinBank"),
+            app_commands.Choice(name="Sacombank", value="Sacombank"),
+            app_commands.Choice(name="TPBank", value="TPBank"),
+            app_commands.Choice(name="VIB", value="VIB"),
+            app_commands.Choice(name="SHB", value="SHB"),
+            app_commands.Choice(name="MSB", value="MSB"),
+            app_commands.Choice(name="OCB", value="OCB"),
+            app_commands.Choice(name="SeABank", value="SeABank"),
+            app_commands.Choice(name="Eximbank", value="Eximbank"),
+            app_commands.Choice(name="HDBank", value="HDBank"),
+            app_commands.Choice(name="Agribank", value="Agribank"),
+            app_commands.Choice(name="Nam A Bank", value="Nam A Bank"),
+            app_commands.Choice(name="PVcomBank", value="PVcomBank"),
+            app_commands.Choice(name="Bac A Bank", value="Bac A Bank"),
+            app_commands.Choice(name="VietBank", value="VietBank"),
+            app_commands.Choice(name="BaoViet Bank", value="BaoViet Bank"),
+            app_commands.Choice(name="NCB", value="NCB"),
+            app_commands.Choice(name="KienlongBank", value="KienlongBank"),
+            app_commands.Choice(name="ABBank", value="ABBank"),
+        ]
+    )
+    async def addbank(
+        self,
+        interaction: discord.Interaction,
+        bank_name: app_commands.Choice[str],
+        account_number: str,
+        account_name: str
+    ):
+        if not has_ticket_manage_permission(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Chỉ Support/Admin/Founder mới được lưu thông tin ngân hàng!",
+                ephemeral=True
+            )
+
+        selected_bank = bank_name.value
+        account_number = account_number.replace(" ", "").strip()
+        account_name = account_name.strip().upper()
+        bank_bin = BANK_BINS.get(selected_bank)
+
+        if not account_number or not account_name:
+            return await interaction.response.send_message(
+                "❌ Vui lòng nhập đầy đủ số tài khoản và tên chủ tài khoản!",
+                ephemeral=True
+            )
+
+        if not account_number.isdigit():
+            return await interaction.response.send_message(
+                "❌ Số tài khoản chỉ được chứa chữ số!",
+                ephemeral=True
+            )
+
+        db.upsert_bank_account(
+            discord_id=interaction.user.id,
+            bank_name=selected_bank,
+            bank_bin=bank_bin,
+            account_number=account_number,
+            account_name=account_name,
+        )
+
+        embed = discord.Embed(
+            title="✅ Đã lưu thông tin ngân hàng",
+            color=config.COLOR_SUCCESS,
+            timestamp=datetime.now()
+        )
+        embed.add_field(
+            name="🏦 Ngân hàng",
+            value=selected_bank,
+            inline=True
+        )
+        embed.add_field(
+            name="💳 Số tài khoản",
+            value=f"`{account_number}`",
+            inline=True
+        )
+        embed.add_field(
+            name="👤 Chủ tài khoản",
+            value=account_name,
+            inline=False
+        )
+        embed.add_field(
+            name="🔢 BIN tự động",
+            value=f"`{bank_bin}`",
+            inline=True
+        )
+        embed.set_footer(
+            text="Bot đã tự nhận BIN theo ngân hàng đã chọn."
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True
+        )
+
+    @app_commands.command(
+        name="infobank",
+        description="🏦 Xem thông tin ngân hàng đã lưu"
+    )
+    @app_commands.describe(
+        member="Xem thông tin của nhân viên khác (chỉ Admin/Founder)"
+    )
+    async def infobank(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member = None
+    ):
+        target = member or interaction.user
+
+        if target.id != interaction.user.id:
+            if not has_admin_ticket_permission(interaction.user):
+                return await interaction.response.send_message(
+                    "❌ Chỉ Admin/Founder mới được xem thông tin ngân hàng của người khác!",
+                    ephemeral=True
+                )
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            bank = db.get_bank_account(target.id)
+
+            if not bank:
+                message = (
+                    f"❌ {target.mention} chưa lưu thông tin ngân hàng."
+                    if target.id != interaction.user.id
+                    else "❌ Bạn chưa lưu thông tin ngân hàng. Dùng `/addbank` trước nhé!"
+                )
+                return await interaction.followup.send(
+                    message,
+                    ephemeral=True
+                )
+
+            account_name = str(bank.get("account_name") or "")
+            account_number = str(bank.get("account_number") or "")
+            bank_bin = str(bank.get("bank_bin") or "")
+            encoded_name = urllib.parse.quote(account_name)
+
+            embed = discord.Embed(
+                title=f"🏦 Thông tin ngân hàng — {target.display_name}",
+                color=config.COLOR_INFO,
+                timestamp=datetime.now()
+            )
+            embed.add_field(
+                name="🏦 Ngân hàng",
+                value=bank.get("bank_name") or "Không rõ",
+                inline=True
+            )
+            embed.add_field(
+                name="💳 Số tài khoản",
+                value=f"`{account_number}`",
+                inline=True
+            )
+            embed.add_field(
+                name="👤 Chủ tài khoản",
+                value=account_name or "Không rõ",
+                inline=False
+            )
+
+            if bank_bin and account_number:
+                qr_url = (
+                    "https://img.vietqr.io/image/"
+                    f"{bank_bin}-{account_number}-compact2.png"
+                    f"?accountName={encoded_name}"
+                )
+                embed.add_field(
+                    name="🔢 BIN",
+                    value=f"`{bank_bin}`",
+                    inline=True
+                )
+                embed.set_image(url=qr_url)
+            else:
+                embed.add_field(
+                    name="ℹ️ QR",
+                    value="Chưa đủ BIN hoặc số tài khoản để tạo QR.",
+                    inline=False
+                )
+
+            embed.set_footer(text=config.BOT_FOOTER)
+
+            await interaction.followup.send(
+                embed=embed,
+                ephemeral=True
+            )
+
+        except Exception as error:
+            import traceback
+            traceback.print_exc()
+            await interaction.followup.send(
+                f"❌ Lỗi `/infobank`: `{type(error).__name__}: {error}`",
+                ephemeral=True
+            )
+
+    @app_commands.command(
+        name="qr",
+        description="💳 Tạo mã QR thanh toán ở bất kỳ kênh nào"
+    )
+    @app_commands.describe(
+        amount="Số tiền, ví dụ 20k, 50k, 1m hoặc 50000",
+        content="Nội dung chuyển khoản",
+        member="Dùng tài khoản ngân hàng của người khác (Admin/Founder)"
+    )
+    async def qr(
+        self,
+        interaction: discord.Interaction,
+        amount: str,
+        content: str = "LOVE STORE",
+        member: discord.Member = None
+    ):
+        target = member or interaction.user
+
+        if target.id != interaction.user.id:
+            if not has_admin_ticket_permission(interaction.user):
+                return await interaction.response.send_message(
+                    "❌ Chỉ Admin/Founder mới được tạo QR từ ngân hàng của người khác!",
+                    ephemeral=True
+                )
+
+        await interaction.response.defer()
+
+        try:
+            amount_text = amount.strip().lower().replace(",", ".")
+
+            if amount_text.endswith("k"):
+                amount_value = int(float(amount_text[:-1]) * 1_000)
+            elif amount_text.endswith("m"):
+                amount_value = int(float(amount_text[:-1]) * 1_000_000)
+            else:
+                amount_value = int(float(amount_text))
+
+            if amount_value <= 0:
+                return await interaction.followup.send(
+                    "❌ Số tiền phải lớn hơn 0!",
+                    ephemeral=True
+                )
+
+            bank = db.get_bank_account(target.id)
+
+            if not bank:
+                return await interaction.followup.send(
+                    (
+                        f"❌ {target.mention} chưa lưu thông tin ngân hàng bằng `/addbank`."
+                        if target.id != interaction.user.id
+                        else "❌ Bạn chưa lưu thông tin ngân hàng. Dùng `/addbank` trước nhé!"
+                    ),
+                    ephemeral=True
+                )
+
+            bank_name = str(bank.get("bank_name") or "Không rõ")
+            bank_bin = str(bank.get("bank_bin") or "")
+            account_number = str(bank.get("account_number") or "")
+            account_name = str(bank.get("account_name") or "")
+            transfer_content = content.strip()[:50] or "LOVE STORE"
+
+            if not bank_bin or not account_number:
+                return await interaction.followup.send(
+                    "❌ Tài khoản ngân hàng này chưa đủ BIN hoặc số tài khoản để tạo QR!",
+                    ephemeral=True
+                )
+
+            qr_url = (
+                "https://img.vietqr.io/image/"
+                f"{bank_bin}-{account_number}-compact2.png"
+                f"?amount={amount_value}"
+                f"&addInfo={urllib.parse.quote(transfer_content)}"
+                f"&accountName={urllib.parse.quote(account_name)}"
+            )
+
+            amount_fmt = f"{amount_value:,}".replace(",", ".")
+
+            embed = discord.Embed(
+                title="💳 Mã QR Thanh Toán",
+                description="Quét mã QR bên dưới để thanh toán nhanh.",
+                color=config.COLOR_PRIMARY,
+                timestamp=datetime.now()
+            )
+            embed.add_field(
+                name="🏦 Ngân hàng",
+                value=bank_name,
+                inline=True
+            )
+            embed.add_field(
+                name="💳 Số tài khoản",
+                value=f"`{account_number}`",
+                inline=True
+            )
+            embed.add_field(
+                name="👤 Chủ tài khoản",
+                value=account_name,
+                inline=False
+            )
+            embed.add_field(
+                name="💰 Số tiền",
+                value=f"**{amount_fmt} VNĐ**",
+                inline=True
+            )
+            embed.add_field(
+                name="📝 Nội dung CK",
+                value=f"`{transfer_content}`",
+                inline=True
+            )
+            embed.set_image(url=qr_url)
+            embed.set_footer(
+                text=f"Tạo bởi {interaction.user.display_name} • {config.BOT_FOOTER}"
+            )
+
+            await interaction.followup.send(embed=embed)
+
+        except ValueError:
+            await interaction.followup.send(
+                "❌ Số tiền không hợp lệ! Ví dụ: `20k`, `1m`, `50000`.",
+                ephemeral=True
+            )
+        except Exception as error:
+            import traceback
+            traceback.print_exc()
+            await interaction.followup.send(
+                f"❌ Lỗi `/qr`: `{type(error).__name__}: {error}`",
+                ephemeral=True
+            )
+
+    @app_commands.command(
+        name="addcode",
+        description="🎟️ Tạo mã giảm giá mới (Founder only)"
+    )
+    @app_commands.describe(
+        code="Mã giảm giá (VD: SALE10K)",
+        amount="Số tiền giảm (VD: 10k, 50k, 1m)",
+        expires="Ngày hết hạn DD/MM/YYYY (để trống nếu không giới hạn)"
+    )
+    async def addcode(
+        self,
+        interaction: discord.Interaction,
+        code: str,
+        amount: str,
+        expires: str = None
+    ):
+        if not any(
+            role.id == config.FOUNDER_ROLE_ID
+            for role in interaction.user.roles
+        ):
+            return await interaction.response.send_message(
+                "❌ Chỉ Founder mới dùng được!",
+                ephemeral=True
+            )
+
+        try:
+            text = amount.strip().lower()
+
+            if text.endswith("k"):
+                amt = int(float(text[:-1]) * 1000)
+            elif text.endswith("m"):
+                amt = int(float(text[:-1]) * 1000000)
+            else:
+                amt = int(float(text))
+
+            expires_at = None
+
+            if expires:
+                try:
+                    expires_at = datetime.strptime(
+                        expires.strip(),
+                        "%d/%m/%Y"
+                    ).strftime("%Y-%m-%d")
+                except ValueError:
+                    return await interaction.response.send_message(
+                        "❌ Ngày hết hạn sai định dạng! Dùng: `DD/MM/YYYY`",
+                        ephemeral=True
+                    )
+
+            db.create_discount(code, amt, expires_at)
+
+            embed = discord.Embed(
+                title="✅ Đã tạo mã giảm giá",
+                color=config.COLOR_SUCCESS,
+                timestamp=datetime.now()
+            )
+            embed.add_field(
+                name="🎟️ Mã",
+                value=f"`{code.upper()}`",
+                inline=True
+            )
+            embed.add_field(
+                name="💰 Giảm",
+                value=f"{amt:,} VNĐ".replace(",", "."),
+                inline=True
+            )
+            embed.add_field(
+                name="📅 Hết hạn",
+                value=expires_at or "Không giới hạn",
+                inline=True
+            )
+            embed.set_footer(text=config.BOT_FOOTER)
+
+            await interaction.response.send_message(
+                embed=embed,
+                ephemeral=True
+            )
+
+        except Exception as error:
+            await interaction.response.send_message(
+                f"❌ Lỗi: `{error}`",
+                ephemeral=True
+            )
+
+    @app_commands.command(
+        name="codes",
+        description="🎟️ Xem tất cả mã giảm giá (Founder only)"
+    )
+    async def codes(self, interaction: discord.Interaction):
+        if not any(
+            role.id == config.FOUNDER_ROLE_ID
+            for role in interaction.user.roles
+        ):
+            return await interaction.response.send_message(
+                "❌ Chỉ Founder mới dùng được!",
+                ephemeral=True
+            )
+
+        rows = db.get_all_discounts()
+
+        embed = discord.Embed(
+            title="🎟️ Danh sách mã giảm giá",
+            color=config.COLOR_INFO,
+            timestamp=datetime.now()
+        )
+
+        if not rows:
+            embed.description = "Chưa có mã nào!"
+        else:
+            for row in rows:
+                status = "✅ Còn" if not row["used"] else "❌ Đã dùng"
+                amount = f"{row['amount']:,}".replace(",", ".")
+
+                embed.add_field(
+                    name=f"`{row['code']}`",
+                    value=(
+                        f"💰 Giảm: **{amount} VNĐ**\n"
+                        f"📅 HH: {row['expires_at'] or 'Không giới hạn'}\n"
+                        f"📌 {status}"
+                    ),
+                    inline=True
+                )
+
+        embed.set_footer(text=config.BOT_FOOTER)
+
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True
+        )
+
+    @app_commands.command(
+        name="delcode",
+        description="🗑️ Xóa mã giảm giá (Founder only)"
+    )
+    @app_commands.describe(code="Mã cần xóa")
+    async def delcode(
+        self,
+        interaction: discord.Interaction,
+        code: str
+    ):
+        if not any(
+            role.id == config.FOUNDER_ROLE_ID
+            for role in interaction.user.roles
+        ):
+            return await interaction.response.send_message(
+                "❌ Chỉ Founder mới dùng được!",
+                ephemeral=True
+            )
+
+        db.delete_discount(code)
+
+        await interaction.response.send_message(
+            f"🗑️ Đã xóa mã `{code.upper()}`!",
+            ephemeral=True
+        )
 
 
 async def setup(bot):

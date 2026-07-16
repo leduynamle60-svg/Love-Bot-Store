@@ -147,3 +147,91 @@ def start_webhook_thread():
     t = threading.Thread(target=run_webhook, daemon=True)
     t.start()
     print(f"[Webhook] Server đang chạy tại http://{config.WEBHOOK_HOST}:{config.WEBHOOK_PORT}")
+
+# ── Web nội bộ V2.1: sửa feedback Discord ───────────────────
+def _parse_discord_message_url(message_url: str):
+    """Nhận link https://discord.com/channels/GUILD/CHANNEL/MESSAGE."""
+    import re
+    match = re.search(r"discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)", message_url)
+    if not match:
+        raise ValueError("Link tin nhắn Discord không hợp lệ")
+    return tuple(int(x) for x in match.groups())
+
+
+def edit_feedback_message_sync(message_url: str, new_order_code: str, new_product_name: str):
+    """
+    Được gọi từ Flask thread. Chỉ sửa 2 field trong embed feedback:
+    - Mã đơn
+    - Sản phẩm
+    Không sửa số sao, nội dung feedback, khách hàng hoặc thời gian.
+    """
+    if not _bot or not _bot.loop or _bot.is_closed():
+        return {"success": False, "message": "Bot Discord chưa online"}
+
+    try:
+        guild_id, channel_id, message_id = _parse_discord_message_url(message_url)
+    except ValueError as e:
+        return {"success": False, "message": str(e)}
+
+    async def _edit():
+        import discord
+        guild = _bot.get_guild(guild_id)
+        if not guild:
+            return {"success": False, "message": "Bot không ở trong server của link này"}
+
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await _bot.fetch_channel(channel_id)
+            except Exception:
+                return {"success": False, "message": "Không tìm thấy kênh hoặc bot thiếu quyền xem kênh"}
+
+        try:
+            message = await channel.fetch_message(message_id)
+        except discord.NotFound:
+            return {"success": False, "message": "Không tìm thấy tin nhắn"}
+        except discord.Forbidden:
+            return {"success": False, "message": "Bot thiếu quyền đọc lịch sử tin nhắn"}
+
+        if message.author.id != _bot.user.id:
+            return {"success": False, "message": "Bot chỉ có thể sửa tin nhắn do chính nó gửi"}
+        if not message.embeds:
+            return {"success": False, "message": "Tin nhắn này không có embed feedback"}
+
+        old = message.embeds[0]
+        new_embed = discord.Embed.from_dict(old.to_dict())
+        changed_order = False
+        changed_product = False
+
+        for index, field in enumerate(list(new_embed.fields)):
+            name = field.name.strip().lower()
+            if "mã đơn" in name or "ma don" in name:
+                new_embed.set_field_at(index, name=field.name, value=f"`{new_order_code}`", inline=field.inline)
+                changed_order = True
+            elif "sản phẩm" in name or "san pham" in name:
+                new_embed.set_field_at(index, name=field.name, value=new_product_name, inline=field.inline)
+                changed_product = True
+
+        if not changed_order or not changed_product:
+            return {
+                "success": False,
+                "message": "Embed không có đủ field Mã đơn và Sản phẩm để sửa"
+            }
+
+        try:
+            await message.edit(embed=new_embed)
+        except discord.Forbidden:
+            return {"success": False, "message": "Bot thiếu quyền sửa tin nhắn"}
+
+        return {
+            "success": True,
+            "message": "Đã cập nhật feedback Discord",
+            "channel_id": channel_id,
+            "message_id": message_id,
+        }
+
+    future = asyncio.run_coroutine_threadsafe(_edit(), _bot.loop)
+    try:
+        return future.result(timeout=15)
+    except Exception as e:
+        return {"success": False, "message": f"Discord xử lý quá lâu hoặc lỗi: {e}"}
