@@ -2,6 +2,8 @@
 cogs/slash.py — Slash commands cho Love Bot Store
 """
 import urllib.parse
+import os
+import secrets
 from datetime import datetime
 
 import discord
@@ -30,6 +32,110 @@ def has_admin_ticket_permission(member: discord.Member) -> bool:
         or config.FOUNDER_ROLE_ID in role_ids
         or member.guild_permissions.administrator
     )
+
+
+
+
+def is_founder(member: discord.Member) -> bool:
+    return (
+        any(role.id == config.FOUNDER_ROLE_ID for role in member.roles)
+        or member.guild_permissions.administrator
+    )
+
+
+def is_admin(member: discord.Member) -> bool:
+    return (
+        is_founder(member)
+        or any(role.id == config.ADMIN_ROLE_ID for role in member.roles)
+    )
+
+
+def is_support(member: discord.Member) -> bool:
+    return (
+        is_admin(member)
+        or any(role.id == config.SUPPORT_ROLE_ID for role in member.roles)
+    )
+
+
+def privileged_rank(member: discord.Member) -> int:
+    """0=member/buyer, 1=support, 2=admin, 3=founder."""
+    if is_founder(member):
+        return 3
+    if any(role.id == config.ADMIN_ROLE_ID for role in member.roles):
+        return 2
+    if any(role.id == config.SUPPORT_ROLE_ID for role in member.roles):
+        return 1
+    return 0
+
+
+def parse_money(text: str) -> int:
+    value = text.strip().lower().replace(" ", "").replace(",", ".")
+    if value.endswith("k"):
+        amount = int(float(value[:-1]) * 1_000)
+    elif value.endswith("m"):
+        amount = int(float(value[:-1]) * 1_000_000)
+    else:
+        amount = int(float(value.replace(".", "")))
+
+    if amount <= 0:
+        raise ValueError("Số tiền phải lớn hơn 0")
+    if amount > 1_000_000_000:
+        raise ValueError("Số tiền vượt quá giới hạn 1 tỷ")
+    return amount
+
+
+
+
+def get_store_bank_config():
+    """
+    Đọc tài khoản nhận tiền của Love Store từ config.py hoặc biến môi trường.
+
+    Tên khuyến nghị:
+      STORE_BANK_NAME
+      STORE_BANK_BIN
+      STORE_BANK_ACCOUNT_NUMBER
+      STORE_BANK_ACCOUNT_NAME
+    """
+    def pick(*names):
+        for name in names:
+            value = getattr(config, name, None) or os.getenv(name)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return ""
+
+    bank_name = pick(
+        "STORE_BANK_NAME",
+        "BANK_NAME",
+        "PAYMENT_BANK_NAME",
+    )
+    bank_bin = pick(
+        "STORE_BANK_BIN",
+        "BANK_BIN",
+        "PAYMENT_BANK_BIN",
+    )
+    account_number = pick(
+        "STORE_BANK_ACCOUNT_NUMBER",
+        "BANK_ACCOUNT_NUMBER",
+        "ACCOUNT_NUMBER",
+        "PAYMENT_ACCOUNT_NUMBER",
+    ).replace(" ", "")
+    account_name = pick(
+        "STORE_BANK_ACCOUNT_NAME",
+        "BANK_ACCOUNT_NAME",
+        "ACCOUNT_NAME",
+        "PAYMENT_ACCOUNT_NAME",
+    ).upper()
+
+    return {
+        "bank_name": bank_name,
+        "bank_bin": bank_bin,
+        "account_number": account_number,
+        "account_name": account_name,
+    }
+
+
+def money_fmt(amount: int) -> str:
+    return f"{int(amount):,}".replace(",", ".") + " VNĐ"
 
 
 def ticket_number_from_channel(channel: discord.TextChannel) -> str:
@@ -133,52 +239,48 @@ class SlashCog(commands.Cog):
 
     @app_commands.command(
         name="myorders",
-        description="📦 Xem lịch sử đơn hàng của bạn"
+        description="📦 Xem thống kê đơn hàng của bạn"
     )
     async def myorders(self, interaction: discord.Interaction):
         conn = db.get_conn_dict()
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT *
+            SELECT
+                COUNT(*) AS total_orders,
+                COALESCE(
+                    SUM(amount) FILTER (
+                        WHERE status IN ('paid', 'done')
+                    ),
+                    0
+                ) AS total_spent
             FROM orders
             WHERE user_id=%s
-            ORDER BY created_at DESC
-            LIMIT 5
             """,
             (interaction.user.id,)
         )
-        rows = cur.fetchall()
+        summary = cur.fetchone()
         conn.close()
+
+        total_orders = int(summary["total_orders"] if summary else 0)
+        total_spent = summary["total_spent"] if summary else 0
 
         embed = discord.Embed(
             title=f"📦 Đơn hàng của {interaction.user.display_name}",
+            description=(
+                f"💵 **Tổng chi tiêu:** {money_fmt(total_spent)}\n"
+                f"📦 **Tổng số đơn hàng:** {total_orders}"
+            ),
             color=config.COLOR_INFO,
             timestamp=datetime.now()
         )
 
-        if not rows:
-            embed.description = "Bạn chưa có đơn hàng nào!"
-        else:
-            status_map = {
-                "pending": "⏳ Đang chờ",
-                "processing": "🔄 Đang xử lý",
-                "paid": "💳 Đã thanh toán",
-                "done": "✅ Hoàn tất",
-                "cancelled": "❌ Đã hủy",
-            }
-
-            for row in rows:
-                amount = f"{row['amount']:,}".replace(",", ".")
-                embed.add_field(
-                    name=f"`{row['order_code']}` — {row['product_name']}",
-                    value=(
-                        f"💰 {amount} VNĐ\n"
-                        f"📌 {status_map.get(row['status'], row['status'])}\n"
-                        f"🕐 {row['created_at']}"
-                    ),
-                    inline=False
-                )
+        if total_orders == 0:
+            embed.description = (
+                "Bạn chưa có đơn hàng nào!\n\n"
+                f"💵 **Tổng chi tiêu:** {money_fmt(0)}\n"
+                "📦 **Tổng số đơn hàng:** 0"
+            )
 
         embed.set_footer(text=config.BOT_FOOTER)
         await interaction.response.send_message(
@@ -930,6 +1032,324 @@ class SlashCog(commands.Cog):
                 f"❌ Lỗi `/qr`: `{type(error).__name__}: {error}`",
                 ephemeral=True
             )
+
+
+    @app_commands.command(
+        name="vitien",
+        description="💰 Kiểm tra số dư ví Love Store"
+    )
+    async def vitien(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            wallet = db.get_wallet(
+                interaction.user.id,
+                interaction.user.display_name,
+            )
+
+            embed = discord.Embed(
+                title=f"💰 Ví Love Store — {interaction.user.display_name}",
+                color=config.COLOR_INFO,
+                timestamp=datetime.now()
+            )
+            embed.add_field(
+                name="💵 Số dư hiện tại",
+                value=f"**{money_fmt(wallet['balance'])}**",
+                inline=False
+            )
+            embed.add_field(
+                name="📥 Tổng đã nạp",
+                value=money_fmt(wallet["total_deposit"]),
+                inline=True
+            )
+            embed.set_footer(text=config.BOT_FOOTER)
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as error:
+            await interaction.followup.send(
+                f"❌ Không thể tải ví: `{type(error).__name__}: {error}`",
+                ephemeral=True
+            )
+
+    @app_commands.command(
+        name="naptienvaovi",
+        description="📥 Tạo yêu cầu nạp tiền vào ví Love Store"
+    )
+    @app_commands.describe(
+        amount="Số tiền muốn nạp, ví dụ 20k, 50k hoặc 100000"
+    )
+    async def naptienvaovi(
+        self,
+        interaction: discord.Interaction,
+        amount: str
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            amount_value = parse_money(amount)
+            short_amount = (
+                f"{amount_value // 1_000}K"
+                if amount_value % 1_000 == 0 and amount_value < 1_000_000
+                else str(amount_value)
+            )
+            random_code = secrets.randbelow(9000) + 1000
+            reference_code = f"NAPTIEN{short_amount}-{random_code}"
+
+            bank = get_store_bank_config()
+
+            missing = [
+                key for key in (
+                    "bank_name",
+                    "bank_bin",
+                    "account_number",
+                    "account_name",
+                )
+                if not bank[key]
+            ]
+            if missing:
+                return await interaction.followup.send(
+                    (
+                        "❌ Chưa cấu hình đủ tài khoản nhận tiền của Love Store.\n"
+                        "Cần các biến: `STORE_BANK_NAME`, `STORE_BANK_BIN`, "
+                        "`STORE_BANK_ACCOUNT_NUMBER`, `STORE_BANK_ACCOUNT_NAME`."
+                    ),
+                    ephemeral=True
+                )
+
+            request = db.create_deposit_request(
+                discord_id=interaction.user.id,
+                username=interaction.user.display_name,
+                amount=amount_value,
+                reference_code=reference_code,
+            )
+
+            qr_url = (
+                "https://img.vietqr.io/image/"
+                f"{bank['bank_bin']}-{bank['account_number']}-compact2.png"
+                f"?amount={amount_value}"
+                f"&addInfo={urllib.parse.quote(reference_code)}"
+                f"&accountName={urllib.parse.quote(bank['account_name'])}"
+            )
+
+            embed = discord.Embed(
+                title="📥 Nạp tiền vào ví Love Store",
+                description=(
+                    "Quét QR và chuyển đúng số tiền. "
+                    "Không sửa nội dung chuyển khoản để Founder dễ xác nhận."
+                ),
+                color=config.COLOR_PRIMARY,
+                timestamp=datetime.now()
+            )
+            embed.add_field(
+                name="🏦 Ngân hàng",
+                value=bank["bank_name"],
+                inline=True
+            )
+            embed.add_field(
+                name="💳 Số tài khoản",
+                value=f"`{bank['account_number']}`",
+                inline=True
+            )
+            embed.add_field(
+                name="👤 Chủ tài khoản",
+                value=bank["account_name"],
+                inline=False
+            )
+            embed.add_field(
+                name="💰 Số tiền",
+                value=f"**{money_fmt(amount_value)}**",
+                inline=True
+            )
+            embed.add_field(
+                name="📝 Nội dung chuyển khoản",
+                value=f"`{reference_code}`",
+                inline=False
+            )
+            embed.add_field(
+                name="🧾 Mã yêu cầu",
+                value=f"`{request['transaction_code']}`",
+                inline=True
+            )
+            embed.add_field(
+                name="📌 Trạng thái",
+                value="⏳ Đang chờ Founder duyệt",
+                inline=True
+            )
+            embed.set_image(url=qr_url)
+            embed.set_footer(text=config.BOT_FOOTER)
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except ValueError as error:
+            await interaction.followup.send(
+                f"❌ Số tiền không hợp lệ: {error}",
+                ephemeral=True
+            )
+        except Exception as error:
+            await interaction.followup.send(
+                f"❌ Không thể tạo yêu cầu nạp: `{type(error).__name__}: {error}`",
+                ephemeral=True
+            )
+
+    @app_commands.command(
+        name="congtien",
+        description="➕ Cộng tiền thủ công vào ví (Founder only)"
+    )
+    @app_commands.describe(
+        member="Người được cộng tiền",
+        amount="Số tiền, ví dụ 20k, 50k hoặc 100000",
+        reason="Lý do cộng tiền"
+    )
+    async def congtien(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        amount: str,
+        reason: str
+    ):
+        if not is_founder(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Chỉ Founder mới được dùng `/congtien`!",
+                ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            amount_value = parse_money(amount)
+            result = db.add_wallet_money(
+                discord_id=member.id,
+                username=member.display_name,
+                amount=amount_value,
+                reason=reason.strip()[:250],
+                performed_by=interaction.user.id,
+                performer_name=interaction.user.display_name,
+            )
+
+            embed = discord.Embed(
+                title="✅ Đã cộng tiền vào ví",
+                color=config.COLOR_SUCCESS,
+                timestamp=datetime.now()
+            )
+            embed.add_field(name="👤 Thành viên", value=member.mention, inline=False)
+            embed.add_field(name="➕ Số tiền", value=money_fmt(amount_value), inline=True)
+            embed.add_field(
+                name="💰 Số dư",
+                value=(
+                    f"{money_fmt(result['balance_before'])} → "
+                    f"**{money_fmt(result['balance_after'])}**"
+                ),
+                inline=False
+            )
+            embed.add_field(name="📝 Lý do", value=reason[:1024], inline=False)
+            embed.add_field(
+                name="🧾 Mã giao dịch",
+                value=f"`{result['transaction_code']}`",
+                inline=True
+            )
+            embed.set_footer(text=f"Thực hiện bởi {interaction.user}")
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except ValueError as error:
+            await interaction.followup.send(f"❌ {error}", ephemeral=True)
+        except Exception as error:
+            await interaction.followup.send(
+                f"❌ Lỗi cộng tiền: `{type(error).__name__}: {error}`",
+                ephemeral=True
+            )
+
+    @app_commands.command(
+        name="trutien",
+        description="➖ Trừ tiền trong ví khi khách thanh toán"
+    )
+    @app_commands.describe(
+        member="Người bị trừ tiền",
+        amount="Số tiền, ví dụ 20k, 50k hoặc 100000",
+        reason="Lý do trừ tiền"
+    )
+    async def trutien(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        amount: str,
+        reason: str
+    ):
+        actor_rank = privileged_rank(interaction.user)
+        target_rank = privileged_rank(member)
+
+        if actor_rank < 1:
+            return await interaction.response.send_message(
+                "❌ Chỉ Support/Admin/Founder mới được dùng `/trutien`!",
+                ephemeral=True
+            )
+
+        # Support chỉ trừ member/buyer. Admin không được trừ Founder.
+        if actor_rank == 1 and target_rank >= 1:
+            return await interaction.response.send_message(
+                "❌ Support chỉ được trừ tiền của Member/Buyer!",
+                ephemeral=True
+            )
+
+        if actor_rank == 2 and target_rank >= 3:
+            return await interaction.response.send_message(
+                "❌ Admin không được trừ tiền của Founder!",
+                ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            amount_value = parse_money(amount)
+            result = db.subtract_wallet_money(
+                discord_id=member.id,
+                username=member.display_name,
+                amount=amount_value,
+                reason=reason.strip()[:250],
+                performed_by=interaction.user.id,
+                performer_name=interaction.user.display_name,
+            )
+
+            embed = discord.Embed(
+                title="✅ Đã trừ tiền trong ví",
+                color=config.COLOR_SUCCESS,
+                timestamp=datetime.now()
+            )
+            embed.add_field(name="👤 Thành viên", value=member.mention, inline=False)
+            embed.add_field(name="➖ Số tiền", value=money_fmt(amount_value), inline=True)
+            embed.add_field(
+                name="💰 Số dư",
+                value=(
+                    f"{money_fmt(result['balance_before'])} → "
+                    f"**{money_fmt(result['balance_after'])}**"
+                ),
+                inline=False
+            )
+            embed.add_field(name="📝 Lý do", value=reason[:1024], inline=False)
+            embed.add_field(
+                name="🧾 Mã giao dịch",
+                value=f"`{result['transaction_code']}`",
+                inline=True
+            )
+            embed.set_footer(text=f"Thực hiện bởi {interaction.user}")
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except ValueError as error:
+            if str(error) == "INSUFFICIENT_BALANCE":
+                wallet = db.get_wallet(member.id, member.display_name)
+                return await interaction.followup.send(
+                    (
+                        "❌ Ví không đủ số dư!\n"
+                        f"Số dư hiện tại: **{money_fmt(wallet['balance'])}**"
+                    ),
+                    ephemeral=True
+                )
+
+            await interaction.followup.send(f"❌ {error}", ephemeral=True)
+        except Exception as error:
+            await interaction.followup.send(
+                f"❌ Lỗi trừ tiền: `{type(error).__name__}: {error}`",
+                ephemeral=True
+            )
+
 
     @app_commands.command(
         name="addcode",

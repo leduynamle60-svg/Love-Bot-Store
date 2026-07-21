@@ -1,0 +1,216 @@
+{% extends "base.html" %}
+{% block title %}Ví tiền — Love Bot Store{% endblock %}
+
+{% block content %}
+<div class="flex flex-col gap-6">
+    <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+        <div>
+            <h1 class="text-2xl font-bold text-white">
+                <i class="fa fa-coins text-pink-400 mr-2"></i>Quản lý ví tiền
+            </h1>
+            <p class="text-sm text-gray-400 mt-1">
+                Duyệt yêu cầu nạp, xác nhận cộng thủ công và theo dõi số dư khách hàng.
+            </p>
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div class="card p-5">
+            <div class="text-sm text-gray-400">Đang chờ</div>
+            <div class="text-2xl font-bold text-yellow-400 mt-1">{{ stats.pending or 0 }}</div>
+        </div>
+        <div class="card p-5">
+            <div class="text-sm text-gray-400">Đã duyệt</div>
+            <div class="text-2xl font-bold text-green-400 mt-1">{{ stats.completed or 0 }}</div>
+        </div>
+        <div class="card p-5">
+            <div class="text-sm text-gray-400">Từ chối</div>
+            <div class="text-2xl font-bold text-red-400 mt-1">{{ stats.rejected or 0 }}</div>
+        </div>
+        <div class="card p-5">
+            <div class="text-sm text-gray-400">Tổng đã duyệt</div>
+            <div class="text-xl font-bold text-pink-400 mt-1">
+                {{ "{:,.0f}".format(stats.approved_amount or 0).replace(",", ".") }}đ
+            </div>
+        </div>
+    </div>
+
+    <div class="card p-5">
+        <form method="GET" class="flex flex-col md:flex-row gap-3">
+            <input
+                type="text"
+                name="search"
+                value="{{ search }}"
+                placeholder="Tìm mã TX, nội dung CK, tên hoặc Discord ID..."
+                class="flex-1"
+            >
+            <select name="status">
+                <option value="all" {{ 'selected' if status_filter == 'all' }}>Tất cả trạng thái</option>
+                <option value="pending" {{ 'selected' if status_filter == 'pending' }}>Đang chờ</option>
+                <option value="completed" {{ 'selected' if status_filter == 'completed' }}>Đã hoàn tất</option>
+                <option value="rejected" {{ 'selected' if status_filter == 'rejected' }}>Đã từ chối</option>
+            </select>
+            <button class="btn-primary" type="submit">
+                <i class="fa fa-search mr-1"></i> Lọc
+            </button>
+        </form>
+    </div>
+
+    <div class="card overflow-hidden">
+        <div class="px-5 py-4 border-b border-gray-700">
+            <h2 class="font-semibold text-white">Yêu cầu nạp tiền</h2>
+        </div>
+
+        {% if requests %}
+        <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead class="bg-black bg-opacity-20 text-gray-400">
+                    <tr>
+                        <th class="text-left px-4 py-3">Yêu cầu</th>
+                        <th class="text-left px-4 py-3">Khách hàng</th>
+                        <th class="text-left px-4 py-3">Số tiền</th>
+                        <th class="text-left px-4 py-3">Số dư</th>
+                        <th class="text-left px-4 py-3">Trạng thái</th>
+                        <th class="text-right px-4 py-3">Thao tác</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-800">
+                    {% for item in requests %}
+                    <tr class="hover:bg-white hover:bg-opacity-5 align-top">
+                        <td class="px-4 py-4">
+                            <div class="font-mono text-pink-300">{{ item.transaction_code }}</div>
+                            <div class="font-mono text-xs text-gray-400 mt-1">
+                                {{ item.reference_code or 'Không có nội dung CK' }}
+                            </div>
+                            <div class="text-xs text-gray-500 mt-1">
+                                {{ item.created_at.strftime('%d/%m/%Y %H:%M') if item.created_at else '' }}
+                            </div>
+                        </td>
+                        <td class="px-4 py-4">
+                            <div class="text-white font-medium">{{ item.username or 'Không rõ' }}</div>
+                            <div class="text-xs text-gray-500">{{ item.discord_id }}</div>
+                        </td>
+                        <td class="px-4 py-4 font-semibold text-green-300">
+                            {{ "{:,.0f}".format(item.amount or 0).replace(",", ".") }}đ
+                        </td>
+                        <td class="px-4 py-4">
+                            {{ "{:,.0f}".format(item.current_balance or 0).replace(",", ".") }}đ
+                        </td>
+                        <td class="px-4 py-4">
+                            {% if item.status == 'pending' %}
+                                <span class="px-2 py-1 rounded-full text-xs bg-yellow-700 text-yellow-100">Đang chờ</span>
+                            {% elif item.status == 'completed' %}
+                                <span class="px-2 py-1 rounded-full text-xs bg-green-700 text-green-100">Hoàn tất</span>
+                            {% else %}
+                                <span class="px-2 py-1 rounded-full text-xs bg-red-700 text-red-100">Từ chối</span>
+                            {% endif %}
+                        </td>
+                        <td class="px-4 py-4">
+                            {% if session.role == 'founder' %}
+                                {% if item.status == 'pending' %}
+                                <div class="flex flex-col items-end gap-2 min-w-[210px]">
+                                    <form
+                                        method="POST"
+                                        action="{{ url_for('approve_wallet_deposit', transaction_code=item.transaction_code) }}"
+                                        onsubmit="return confirm('Duyệt và cộng {{ item.amount }}đ vào ví khách?')"
+                                    >
+                                        <button class="w-full bg-green-600 hover:bg-green-700 text-white px-3 py-2 rounded-lg text-xs">
+                                            <i class="fa fa-check mr-1"></i> Duyệt + cộng ví
+                                        </button>
+                                    </form>
+
+                                    <form
+                                        method="POST"
+                                        action="{{ url_for('mark_wallet_deposit_completed', transaction_code=item.transaction_code) }}"
+                                        onsubmit="return confirm('Chỉ đánh dấu hoàn tất, không cộng thêm tiền?')"
+                                    >
+                                        <button class="w-full bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded-lg text-xs">
+                                            <i class="fa fa-check-double mr-1"></i> Đã cộng thủ công
+                                        </button>
+                                    </form>
+
+                                    <form
+                                        method="POST"
+                                        action="{{ url_for('reject_wallet_deposit', transaction_code=item.transaction_code) }}"
+                                        class="flex gap-2"
+                                        onsubmit="return confirm('Từ chối yêu cầu này?')"
+                                    >
+                                        <input
+                                            type="text"
+                                            name="reason"
+                                            placeholder="Lý do từ chối"
+                                            class="text-xs w-32"
+                                        >
+                                        <button class="btn-danger text-xs whitespace-nowrap" type="submit">
+                                            <i class="fa fa-times mr-1"></i> Từ chối
+                                        </button>
+                                    </form>
+                                </div>
+                                {% else %}
+                                <div class="text-right text-xs text-gray-500">
+                                    {{ item.performer_name or 'Hệ thống' }}
+                                </div>
+                                {% endif %}
+                            {% else %}
+                                <div class="text-right text-gray-600">—</div>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="p-10 text-center text-gray-500">
+            <i class="fa fa-inbox text-4xl mb-3"></i>
+            <div>Không có yêu cầu phù hợp.</div>
+        </div>
+        {% endif %}
+    </div>
+
+    <div class="card overflow-hidden">
+        <div class="px-5 py-4 border-b border-gray-700">
+            <h2 class="font-semibold text-white">Số dư khách hàng</h2>
+        </div>
+        {% if wallets %}
+        <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead class="bg-black bg-opacity-20 text-gray-400">
+                    <tr>
+                        <th class="text-left px-4 py-3">Khách hàng</th>
+                        <th class="text-left px-4 py-3">Số dư</th>
+                        <th class="text-left px-4 py-3">Tổng nạp</th>
+                        <th class="text-left px-4 py-3">Tổng chi</th>
+                        <th class="text-left px-4 py-3">Cập nhật</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-800">
+                    {% for wallet in wallets %}
+                    <tr class="hover:bg-white hover:bg-opacity-5">
+                        <td class="px-4 py-4">
+                            <div class="text-white font-medium">{{ wallet.username or 'Không rõ' }}</div>
+                            <div class="text-xs text-gray-500">{{ wallet.discord_id }}</div>
+                        </td>
+                        <td class="px-4 py-4 text-pink-300 font-semibold">
+                            {{ "{:,.0f}".format(wallet.balance or 0).replace(",", ".") }}đ
+                        </td>
+                        <td class="px-4 py-4 text-green-300">
+                            {{ "{:,.0f}".format(wallet.total_deposit or 0).replace(",", ".") }}đ
+                        </td>
+                        <td class="px-4 py-4 text-yellow-300">
+                            {{ "{:,.0f}".format(wallet.total_spent or 0).replace(",", ".") }}đ
+                        </td>
+                        <td class="px-4 py-4 text-gray-400">
+                            {{ wallet.updated_at.strftime('%d/%m/%Y %H:%M') if wallet.updated_at else '' }}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="p-8 text-center text-gray-500">Chưa có ví nào.</div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

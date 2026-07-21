@@ -57,6 +57,9 @@
         <a href="/orders" class="nav-link flex items-center gap-3 px-4 py-2.5 text-gray-300 {{ 'active' if request.path == '/orders' }}">
             <i class="fa fa-box w-5"></i> Đơn hàng
         </a>
+        <a href="/wallets" class="nav-link flex items-center gap-3 px-4 py-2.5 text-gray-300 {{ 'active' if request.path.startswith('/wallets') }}">
+            <i class="fa fa-coins w-5"></i> Ví tiền
+        </a>
         <a href="/customers" class="nav-link flex items-center gap-3 px-4 py-2.5 text-gray-300 {{ 'active' if request.path == '/customers' }}">
             <i class="fa fa-users w-5"></i> Khách hàng
         </a>

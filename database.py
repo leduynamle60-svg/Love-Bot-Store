@@ -152,6 +152,49 @@ def init_db():
         )
     """)
 
+
+    # ── Wallets / Ví tiền ────────────────────────────────────────
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wallets (
+            discord_id       BIGINT PRIMARY KEY,
+            username         TEXT NOT NULL DEFAULT '',
+            balance          BIGINT NOT NULL DEFAULT 0 CHECK (balance >= 0),
+            total_deposit    BIGINT NOT NULL DEFAULT 0 CHECK (total_deposit >= 0),
+            total_spent      BIGINT NOT NULL DEFAULT 0 CHECK (total_spent >= 0),
+            created_at       TIMESTAMP DEFAULT NOW(),
+            updated_at       TIMESTAMP DEFAULT NOW()
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wallet_transactions (
+            id                BIGSERIAL PRIMARY KEY,
+            transaction_code  TEXT UNIQUE NOT NULL,
+            discord_id        BIGINT NOT NULL,
+            username          TEXT NOT NULL DEFAULT '',
+            transaction_type  TEXT NOT NULL,
+            amount            BIGINT NOT NULL CHECK (amount > 0),
+            reason            TEXT,
+            reference_code    TEXT,
+            performed_by      BIGINT,
+            performer_name    TEXT,
+            balance_before    BIGINT NOT NULL DEFAULT 0,
+            balance_after     BIGINT NOT NULL DEFAULT 0,
+            status            TEXT NOT NULL DEFAULT 'completed',
+            created_at        TIMESTAMP DEFAULT NOW()
+        )
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_wallet_transactions_discord_id
+        ON wallet_transactions (discord_id, created_at DESC)
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_wallet_transactions_status
+        ON wallet_transactions (status, created_at DESC)
+    """)
+
     conn.commit()
     conn.close()
     print("[DB] Supabase PostgreSQL sẵn sàng ✅")
@@ -700,6 +743,317 @@ def delete_discount(code):
     )
     conn.commit()
     conn.close()
+
+
+
+
+# ── Wallets / Ví tiền ────────────────────────────────────────
+
+def _wallet_tx_code(cur):
+    """Tạo mã TX tăng dần, ví dụ TX-000001."""
+    cur.execute("SELECT nextval('wallet_transactions_id_seq')")
+    next_id = cur.fetchone()[0]
+    return f"TX-{next_id:06d}", next_id
+
+
+def ensure_wallet(discord_id, username=""):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO wallets (discord_id, username)
+            VALUES (%s, %s)
+            ON CONFLICT (discord_id)
+            DO UPDATE SET
+                username=CASE
+                    WHEN EXCLUDED.username <> '' THEN EXCLUDED.username
+                    ELSE wallets.username
+                END,
+                updated_at=NOW()
+            """,
+            (int(discord_id), username or ""),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_wallet(discord_id, username=""):
+    ensure_wallet(discord_id, username)
+
+    conn = get_conn_dict()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM wallets WHERE discord_id=%s",
+            (int(discord_id),),
+        )
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
+
+
+def get_order_total_spent(discord_id):
+    """
+    Tổng tiền khách đã chi theo bảng orders.
+    Chỉ tính các đơn đã thanh toán hoặc hoàn tất.
+    """
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(amount), 0)
+            FROM orders
+            WHERE user_id=%s
+              AND status IN ('paid', 'done')
+            """,
+            (int(discord_id),),
+        )
+        row = cur.fetchone()
+        return int(row[0] or 0)
+    finally:
+        conn.close()
+
+
+def create_deposit_request(
+    discord_id,
+    username,
+    amount,
+    reference_code,
+    reason="Yêu cầu nạp tiền vào ví",
+):
+    if int(amount) <= 0:
+        raise ValueError("Số tiền phải lớn hơn 0")
+
+    ensure_wallet(discord_id, username)
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+
+        tx_code, reserved_id = _wallet_tx_code(cur)
+        cur.execute(
+            """
+            INSERT INTO wallet_transactions (
+                id, transaction_code, discord_id, username,
+                transaction_type, amount, reason, reference_code,
+                balance_before, balance_after, status
+            )
+            SELECT
+                %s, %s, w.discord_id, %s,
+                'deposit_request', %s, %s, %s,
+                w.balance, w.balance, 'pending'
+            FROM wallets w
+            WHERE w.discord_id=%s
+            """,
+            (
+                reserved_id,
+                tx_code,
+                username or "",
+                int(amount),
+                reason,
+                reference_code,
+                int(discord_id),
+            ),
+        )
+        conn.commit()
+        return {
+            "transaction_code": tx_code,
+            "reference_code": reference_code,
+            "amount": int(amount),
+            "status": "pending",
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def add_wallet_money(
+    discord_id,
+    username,
+    amount,
+    reason,
+    performed_by,
+    performer_name,
+    transaction_type="manual_add",
+):
+    amount = int(amount)
+    if amount <= 0:
+        raise ValueError("Số tiền phải lớn hơn 0")
+
+    ensure_wallet(discord_id, username)
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT balance FROM wallets WHERE discord_id=%s FOR UPDATE",
+            (int(discord_id),),
+        )
+        row = cur.fetchone()
+        before = int(row[0])
+        after = before + amount
+
+        cur.execute(
+            """
+            UPDATE wallets
+            SET balance=%s,
+                total_deposit=total_deposit + %s,
+                username=%s,
+                updated_at=NOW()
+            WHERE discord_id=%s
+            """,
+            (after, amount, username or "", int(discord_id)),
+        )
+
+        tx_code, reserved_id = _wallet_tx_code(cur)
+        cur.execute(
+            """
+            INSERT INTO wallet_transactions (
+                id, transaction_code, discord_id, username,
+                transaction_type, amount, reason,
+                performed_by, performer_name,
+                balance_before, balance_after, status
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'completed')
+            """,
+            (
+                reserved_id,
+                tx_code,
+                int(discord_id),
+                username or "",
+                transaction_type,
+                amount,
+                reason,
+                int(performed_by) if performed_by else None,
+                performer_name or "",
+                before,
+                after,
+            ),
+        )
+
+        conn.commit()
+        return {
+            "transaction_code": tx_code,
+            "balance_before": before,
+            "balance_after": after,
+            "amount": amount,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def subtract_wallet_money(
+    discord_id,
+    username,
+    amount,
+    reason,
+    performed_by,
+    performer_name,
+    transaction_type="manual_subtract",
+):
+    amount = int(amount)
+    if amount <= 0:
+        raise ValueError("Số tiền phải lớn hơn 0")
+
+    ensure_wallet(discord_id, username)
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT balance FROM wallets WHERE discord_id=%s FOR UPDATE",
+            (int(discord_id),),
+        )
+        row = cur.fetchone()
+        before = int(row[0])
+
+        if before < amount:
+            raise ValueError("INSUFFICIENT_BALANCE")
+
+        after = before - amount
+
+        cur.execute(
+            """
+            UPDATE wallets
+            SET balance=%s,
+                total_spent=total_spent + %s,
+                username=%s,
+                updated_at=NOW()
+            WHERE discord_id=%s
+            """,
+            (after, amount, username or "", int(discord_id)),
+        )
+
+        tx_code, reserved_id = _wallet_tx_code(cur)
+        cur.execute(
+            """
+            INSERT INTO wallet_transactions (
+                id, transaction_code, discord_id, username,
+                transaction_type, amount, reason,
+                performed_by, performer_name,
+                balance_before, balance_after, status
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'completed')
+            """,
+            (
+                reserved_id,
+                tx_code,
+                int(discord_id),
+                username or "",
+                transaction_type,
+                amount,
+                reason,
+                int(performed_by) if performed_by else None,
+                performer_name or "",
+                before,
+                after,
+            ),
+        )
+
+        conn.commit()
+        return {
+            "transaction_code": tx_code,
+            "balance_before": before,
+            "balance_after": after,
+            "amount": amount,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_wallet_history(discord_id, limit=10):
+    conn = get_conn_dict()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT *
+            FROM wallet_transactions
+            WHERE discord_id=%s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (int(discord_id), int(limit)),
+        )
+        return list(cur.fetchall())
+    finally:
+        conn.close()
 
 
 # ── Bank Accounts ────────────────────────────────────────────

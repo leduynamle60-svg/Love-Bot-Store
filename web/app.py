@@ -303,6 +303,89 @@ def _send_order_to_discord(order):
         ) from error
 
 
+
+
+# ── Wallet helpers ───────────────────────────────────────────
+
+def _discord_bot_token():
+    return (
+        os.getenv("DISCORD_BOT_TOKEN")
+        or os.getenv("BOT_TOKEN")
+        or getattr(config, "DISCORD_BOT_TOKEN", "")
+        or getattr(config, "BOT_TOKEN", "")
+    ).strip()
+
+
+def _send_discord_dm(discord_id, *, content=None, embed=None):
+    """Gửi DM Discord bằng nội dung chữ, embed hoặc cả hai."""
+    token = _discord_bot_token()
+    if not token:
+        raise RuntimeError("Chưa cấu hình DISCORD_BOT_TOKEN hoặc BOT_TOKEN")
+
+    headers = {
+        "Authorization": f"Bot {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "LoveBotStore-Web/1.0",
+    }
+
+    create_payload = json.dumps({
+        "recipient_id": str(discord_id)
+    }).encode("utf-8")
+
+    create_req = urllib.request.Request(
+        "https://discord.com/api/v10/users/@me/channels",
+        data=create_payload,
+        headers=headers,
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(create_req, timeout=10) as response:
+            dm_channel = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Không tạo được DM channel: HTTP {error.code} — {detail[:300]}"
+        ) from error
+
+    channel_id = dm_channel.get("id")
+    if not channel_id:
+        raise RuntimeError("Discord không trả về ID kênh DM")
+
+    payload_data = {
+        "allowed_mentions": {"parse": []}
+    }
+    if content:
+        payload_data["content"] = str(content)
+    if embed:
+        payload_data["embeds"] = [embed]
+
+    if not content and not embed:
+        raise ValueError("DM phải có content hoặc embed")
+
+    message_payload = json.dumps(payload_data).encode("utf-8")
+
+    message_req = urllib.request.Request(
+        f"https://discord.com/api/v10/channels/{channel_id}/messages",
+        data=message_payload,
+        headers=headers,
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(message_req, timeout=10) as response:
+            return response.status in (200, 201)
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Không gửi được DM: HTTP {error.code} — {detail[:300]}"
+        ) from error
+
+
+def _money(value):
+    return f"{int(value or 0):,}".replace(",", ".") + " VNĐ"
+
+
 # ── Đơn hàng ─────────────────────────────────────────────────
 
 @app.route("/orders")
@@ -546,6 +629,472 @@ def delete_order(order_code):
     conn.close()
     flash(f"🗑️ Đã xóa đơn `{order_code}`!", "success")
     return redirect(url_for("orders"))
+
+
+
+
+# ── Ví tiền ──────────────────────────────────────────────────
+
+@app.route("/wallets")
+@login_required
+@role_required("founder", "admin")
+def wallets():
+    status_filter = request.args.get("status", "pending").strip()
+    search = request.args.get("search", "").strip()
+
+    conn = db.get_conn_dict()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT
+                wt.*,
+                w.balance AS current_balance
+            FROM wallet_transactions wt
+            LEFT JOIN wallets w ON w.discord_id = wt.discord_id
+            WHERE wt.transaction_type='deposit_request'
+        """
+        params = []
+
+        if status_filter != "all":
+            query += " AND wt.status=%s"
+            params.append(status_filter)
+
+        if search:
+            query += """
+                AND (
+                    wt.transaction_code ILIKE %s
+                    OR wt.reference_code ILIKE %s
+                    OR wt.username ILIKE %s
+                    OR CAST(wt.discord_id AS TEXT) ILIKE %s
+                )
+            """
+            like = f"%{search}%"
+            params.extend([like, like, like, like])
+
+        query += " ORDER BY wt.created_at DESC"
+
+        c.execute(query, params)
+        requests = list(c.fetchall())
+
+        c.execute("""
+            SELECT
+                COUNT(*) FILTER (WHERE status='pending') AS pending,
+                COUNT(*) FILTER (WHERE status='completed') AS completed,
+                COUNT(*) FILTER (WHERE status='rejected') AS rejected,
+                COALESCE(SUM(amount) FILTER (WHERE status='completed'), 0) AS approved_amount
+            FROM wallet_transactions
+            WHERE transaction_type='deposit_request'
+        """)
+        stats = c.fetchone()
+
+        c.execute("""
+            SELECT *
+            FROM wallets
+            ORDER BY balance DESC, updated_at DESC
+            LIMIT 100
+        """)
+        wallet_rows = list(c.fetchall())
+
+    finally:
+        conn.close()
+
+    return render_template(
+        "wallets.html",
+        requests=requests,
+        wallets=wallet_rows,
+        stats=stats,
+        status_filter=status_filter,
+        search=search,
+    )
+
+
+@app.route("/wallets/<transaction_code>/approve", methods=["POST"])
+@login_required
+@role_required("founder")
+def approve_wallet_deposit(transaction_code):
+    conn = db.get_conn()
+    try:
+        c = conn.cursor()
+
+        # Khóa yêu cầu để không thể bấm duyệt hai lần.
+        c.execute(
+            """
+            SELECT id, discord_id, username, amount, reference_code, status
+            FROM wallet_transactions
+            WHERE transaction_code=%s
+              AND transaction_type='deposit_request'
+            FOR UPDATE
+            """,
+            (transaction_code,),
+        )
+        request_row = c.fetchone()
+
+        if not request_row:
+            conn.rollback()
+            flash("❌ Không tìm thấy yêu cầu nạp tiền!", "error")
+            return redirect(url_for("wallets"))
+
+        request_id, discord_id, username, amount, reference_code, status = request_row
+
+        if status != "pending":
+            conn.rollback()
+            flash(
+                f"⚠️ Yêu cầu `{transaction_code}` đã được xử lý trước đó.",
+                "error"
+            )
+            return redirect(url_for("wallets"))
+
+        c.execute(
+            """
+            INSERT INTO wallets (discord_id, username)
+            VALUES (%s, %s)
+            ON CONFLICT (discord_id)
+            DO UPDATE SET
+                username=EXCLUDED.username,
+                updated_at=NOW()
+            """,
+            (discord_id, username or ""),
+        )
+
+        c.execute(
+            "SELECT balance FROM wallets WHERE discord_id=%s FOR UPDATE",
+            (discord_id,),
+        )
+        balance_before = int(c.fetchone()[0])
+        balance_after = balance_before + int(amount)
+
+        c.execute(
+            """
+            UPDATE wallets
+            SET balance=%s,
+                total_deposit=total_deposit + %s,
+                updated_at=NOW()
+            WHERE discord_id=%s
+            """,
+            (balance_after, amount, discord_id),
+        )
+
+        c.execute(
+            """
+            UPDATE wallet_transactions
+            SET status='completed',
+                performed_by=%s,
+                performer_name=%s,
+                balance_before=%s,
+                balance_after=%s,
+                reason=COALESCE(reason, '') || %s
+            WHERE id=%s
+            """,
+            (
+                int(session.get("user_id") or 0),
+                session.get("display", "Web"),
+                balance_before,
+                balance_after,
+                " | Duyệt và cộng ví trên web",
+                request_id,
+            ),
+        )
+
+        conn.commit()
+
+    except Exception as error:
+        conn.rollback()
+        flash(f"❌ Không thể duyệt yêu cầu: {error}", "error")
+        return redirect(url_for("wallets"))
+    finally:
+        conn.close()
+
+    dm_error = None
+    try:
+        _send_discord_dm(
+            discord_id,
+            embed={
+                "title": "✅ Nạp tiền thành công",
+                "description": (
+                    "Yêu cầu nạp tiền của bạn đã được Founder duyệt "
+                    "và cộng vào ví Love Store."
+                ),
+                "color": 0x2ECC71,
+                "fields": [
+                    {
+                        "name": "🧾 Mã giao dịch",
+                        "value": f"`{transaction_code}`",
+                        "inline": True,
+                    },
+                    {
+                        "name": "💰 Số tiền",
+                        "value": f"**{_money(amount)}**",
+                        "inline": True,
+                    },
+                    {
+                        "name": "💳 Số dư mới",
+                        "value": f"**{_money(balance_after)}**",
+                        "inline": False,
+                    },
+                    {
+                        "name": "📝 Nội dung chuyển khoản",
+                        "value": f"`{reference_code}`",
+                        "inline": False,
+                    },
+                ],
+                "footer": {
+                    "text": getattr(config, "BOT_FOOTER", "Love Store")
+                },
+                "timestamp": datetime.utcnow().isoformat(),
+            },
+        )
+    except Exception as error:
+        dm_error = str(error)
+
+    try:
+        wdb.add_log(
+            "Duyệt nạp ví",
+            f"{transaction_code} — {username} — {_money(amount)}",
+            session.get("display", "Web"),
+        )
+    except Exception as log_error:
+        print(f"[Wallet Log] {log_error}")
+
+    if dm_error:
+        flash(
+            f"✅ Đã cộng {_money(amount)} vào ví, nhưng không DM được khách: {dm_error}",
+            "success"
+        )
+    else:
+        flash(
+            f"✅ Đã duyệt `{transaction_code}`, cộng {_money(amount)} và DM khách!",
+            "success"
+        )
+
+    return redirect(url_for("wallets"))
+
+
+@app.route("/wallets/<transaction_code>/mark-completed", methods=["POST"])
+@login_required
+@role_required("founder")
+def mark_wallet_deposit_completed(transaction_code):
+    """Đánh dấu đã xử lý khi tiền đã được cộng thủ công bằng /congtien."""
+    conn = db.get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT id, discord_id, username, amount, reference_code, status
+            FROM wallet_transactions
+            WHERE transaction_code=%s
+              AND transaction_type='deposit_request'
+            FOR UPDATE
+            """,
+            (transaction_code,),
+        )
+        row = c.fetchone()
+
+        if not row:
+            conn.rollback()
+            flash("❌ Không tìm thấy yêu cầu nạp tiền!", "error")
+            return redirect(url_for("wallets"))
+
+        request_id, discord_id, username, amount, reference_code, status = row
+
+        if status != "pending":
+            conn.rollback()
+            flash("⚠️ Yêu cầu này đã được xử lý trước đó.", "error")
+            return redirect(url_for("wallets"))
+
+        c.execute(
+            "SELECT balance FROM wallets WHERE discord_id=%s",
+            (discord_id,),
+        )
+        wallet_row = c.fetchone()
+        current_balance = int(wallet_row[0]) if wallet_row else 0
+
+        c.execute(
+            """
+            UPDATE wallet_transactions
+            SET status='completed',
+                performed_by=%s,
+                performer_name=%s,
+                balance_before=%s,
+                balance_after=%s,
+                reason=COALESCE(reason, '') || %s
+            WHERE id=%s
+            """,
+            (
+                int(session.get("user_id") or 0),
+                session.get("display", "Web"),
+                current_balance,
+                current_balance,
+                " | Đã cộng thủ công, web chỉ xác nhận",
+                request_id,
+            ),
+        )
+        conn.commit()
+
+    except Exception as error:
+        conn.rollback()
+        flash(f"❌ Không thể xác nhận yêu cầu: {error}", "error")
+        return redirect(url_for("wallets"))
+    finally:
+        conn.close()
+
+    dm_error = None
+    try:
+        _send_discord_dm(
+            discord_id,
+            embed={
+                "title": "✅ Đã xác nhận nạp tiền",
+                "description": (
+                    "Founder đã xác nhận tiền được cộng thủ công "
+                    "vào ví Love Store của bạn."
+                ),
+                "color": 0x3498DB,
+                "fields": [
+                    {
+                        "name": "🧾 Mã giao dịch",
+                        "value": f"`{transaction_code}`",
+                        "inline": True,
+                    },
+                    {
+                        "name": "💰 Số tiền",
+                        "value": f"**{_money(amount)}**",
+                        "inline": True,
+                    },
+                    {
+                        "name": "💳 Số dư hiện tại",
+                        "value": f"**{_money(current_balance)}**",
+                        "inline": False,
+                    },
+                ],
+                "footer": {
+                    "text": getattr(config, "BOT_FOOTER", "Love Store")
+                },
+                "timestamp": datetime.utcnow().isoformat(),
+            },
+        )
+    except Exception as error:
+        dm_error = str(error)
+
+    if dm_error:
+        flash(
+            f"✅ Đã đánh dấu hoàn tất, nhưng không DM được khách: {dm_error}",
+            "success"
+        )
+    else:
+        flash("✅ Đã đánh dấu hoàn tất và DM khách!", "success")
+
+    return redirect(url_for("wallets"))
+
+
+@app.route("/wallets/<transaction_code>/reject", methods=["POST"])
+@login_required
+@role_required("founder")
+def reject_wallet_deposit(transaction_code):
+    reject_reason = request.form.get("reason", "").strip() or "Không xác nhận được giao dịch"
+
+    conn = db.get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT id, discord_id, amount, reference_code, status
+            FROM wallet_transactions
+            WHERE transaction_code=%s
+              AND transaction_type='deposit_request'
+            FOR UPDATE
+            """,
+            (transaction_code,),
+        )
+        row = c.fetchone()
+
+        if not row:
+            conn.rollback()
+            flash("❌ Không tìm thấy yêu cầu nạp tiền!", "error")
+            return redirect(url_for("wallets"))
+
+        request_id, discord_id, amount, reference_code, status = row
+
+        if status != "pending":
+            conn.rollback()
+            flash("⚠️ Yêu cầu này đã được xử lý trước đó.", "error")
+            return redirect(url_for("wallets"))
+
+        c.execute(
+            """
+            UPDATE wallet_transactions
+            SET status='rejected',
+                performed_by=%s,
+                performer_name=%s,
+                reason=%s
+            WHERE id=%s
+            """,
+            (
+                int(session.get("user_id") or 0),
+                session.get("display", "Web"),
+                reject_reason[:500],
+                request_id,
+            ),
+        )
+        conn.commit()
+
+    except Exception as error:
+        conn.rollback()
+        flash(f"❌ Không thể từ chối yêu cầu: {error}", "error")
+        return redirect(url_for("wallets"))
+    finally:
+        conn.close()
+
+    dm_error = None
+    try:
+        _send_discord_dm(
+            discord_id,
+            embed={
+                "title": "❌ Yêu cầu nạp tiền bị từ chối",
+                "description": (
+                    "Yêu cầu của bạn chưa được xác nhận. "
+                    "Hãy liên hệ Support nếu bạn đã chuyển khoản."
+                ),
+                "color": 0xE74C3C,
+                "fields": [
+                    {
+                        "name": "🧾 Mã giao dịch",
+                        "value": f"`{transaction_code}`",
+                        "inline": True,
+                    },
+                    {
+                        "name": "💰 Số tiền",
+                        "value": f"**{_money(amount)}**",
+                        "inline": True,
+                    },
+                    {
+                        "name": "📝 Nội dung chuyển khoản",
+                        "value": f"`{reference_code}`",
+                        "inline": False,
+                    },
+                    {
+                        "name": "📌 Lý do",
+                        "value": reject_reason[:1024],
+                        "inline": False,
+                    },
+                ],
+                "footer": {
+                    "text": getattr(config, "BOT_FOOTER", "Love Store")
+                },
+                "timestamp": datetime.utcnow().isoformat(),
+            },
+        )
+    except Exception as error:
+        dm_error = str(error)
+
+    if dm_error:
+        flash(
+            f"✅ Đã từ chối yêu cầu, nhưng không DM được khách: {dm_error}",
+            "success"
+        )
+    else:
+        flash("✅ Đã từ chối yêu cầu và DM khách!", "success")
+
+    return redirect(url_for("wallets"))
 
 
 # ── Khách hàng ────────────────────────────────────────────────
@@ -838,6 +1387,5 @@ if __name__ == "__main__":
     wdb.init_web_db()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
-
 
 
