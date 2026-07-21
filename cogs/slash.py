@@ -193,16 +193,18 @@ class SlashCog(commands.Cog):
         cur.execute(
             """
             SELECT
-                user_id,
-                username,
+                LOWER(TRIM(username)) AS buyer_key,
+                MIN(username) AS username,
                 COUNT(*) AS total_orders,
                 COALESCE(SUM(amount), 0) AS total_spent
             FROM orders
             WHERE status IN ('paid', 'done')
-              AND EXTRACT(MONTH FROM created_at)=%s
-              AND EXTRACT(YEAR FROM created_at)=%s
-            GROUP BY user_id, username
-            ORDER BY total_spent DESC
+              AND EXTRACT(MONTH FROM created_at) = %s
+              AND EXTRACT(YEAR FROM created_at) = %s
+              AND username IS NOT NULL
+              AND TRIM(username) <> ''
+            GROUP BY LOWER(TRIM(username))
+            ORDER BY total_spent DESC, total_orders DESC
             LIMIT 10
             """,
             (month, year)
@@ -222,14 +224,28 @@ class SlashCog(commands.Cog):
             medals = ["🥇", "🥈", "🥉"]
             lines = []
 
+            total_customers = len(rows)
+            leaderboard_revenue = sum(
+                int(row["total_spent"] or 0)
+                for row in rows
+            )
+            revenue_text = f"{leaderboard_revenue:,}".replace(",", ".")
+
+            lines.append(
+                f"👥 **{total_customers} khách hàng** • "
+                f"💰 **Tổng doanh thu BXH: {revenue_text} VNĐ**"
+            )
+            lines.append("")
+
             for index, row in enumerate(rows):
-                medal = medals[index] if index < 3 else f"`#{index + 1}`"
-                member = interaction.guild.get_member(row["user_id"])
-                name = member.display_name if member else row["username"]
-                spent = f"{row['total_spent']:,}".replace(",", ".")
+                rank = medals[index] if index < 3 else f"#{index + 1}"
+                name = row["username"]
+                order_count = int(row["total_orders"] or 0)
+                spent = f"{int(row['total_spent'] or 0):,}".replace(",", ".")
+
                 lines.append(
-                    f"{medal} **{name}** — "
-                    f"{row['total_orders']} đơn — {spent} VNĐ"
+                    f"{rank} **{name}** — "
+                    f"{order_count} đơn — {spent} VNĐ"
                 )
 
             embed.description = "\n".join(lines)
