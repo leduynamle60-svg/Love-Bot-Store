@@ -316,6 +316,58 @@ def _discord_bot_token():
     ).strip()
 
 
+def _send_discord_channel_embed(channel_id, embed):
+    """Gửi embed vào một kênh Discord bằng Bot REST API."""
+    token = _discord_bot_token()
+    if not token:
+        raise RuntimeError("Chưa cấu hình DISCORD_BOT_TOKEN hoặc BOT_TOKEN")
+
+    channel_id = int(channel_id or 0)
+    if not channel_id:
+        raise RuntimeError("Chưa cấu hình WALLET_LOG_CHANNEL_ID")
+
+    payload = json.dumps({
+        "embeds": [embed],
+        "allowed_mentions": {"parse": []},
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        f"https://discord.com/api/v10/channels/{channel_id}/messages",
+        data=payload,
+        headers={
+            "Authorization": f"Bot {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "LoveBotStore-Web/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return response.status in (200, 201)
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Không gửi được wallet log: HTTP {error.code} — {detail[:300]}"
+        ) from error
+
+
+def _send_wallet_web_log(title, color, fields, description=None):
+    channel_id = (
+        getattr(config, "WALLET_LOG_CHANNEL_ID", 0)
+        or os.getenv("WALLET_LOG_CHANNEL_ID", "0")
+    )
+    embed = {
+        "title": title,
+        "description": description,
+        "color": color,
+        "fields": fields,
+        "footer": {"text": getattr(config, "BOT_FOOTER", "Love Store")},
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    return _send_discord_channel_embed(channel_id, embed)
+
+
 def _send_discord_dm(discord_id, *, content=None, embed=None):
     """Gửi DM Discord bằng nội dung chữ, embed hoặc cả hai."""
     token = _discord_bot_token()
@@ -848,6 +900,22 @@ def approve_wallet_deposit(transaction_code):
         dm_error = str(error)
 
     try:
+        _send_wallet_web_log(
+            "🟢 Đã duyệt nạp tiền",
+            0x2ECC71,
+            [
+                {"name": "👤 Khách hàng", "value": f"{username or 'Không rõ'}\n`{discord_id}`", "inline": False},
+                {"name": "👑 Người duyệt", "value": session.get("display", "Web"), "inline": False},
+                {"name": "➕ Số tiền", "value": f"**{_money(amount)}**", "inline": True},
+                {"name": "💳 Biến động số dư", "value": f"{_money(balance_before)} → **{_money(balance_after)}**", "inline": False},
+                {"name": "🧾 Mã giao dịch", "value": f"`{transaction_code}`", "inline": True},
+                {"name": "📝 Nội dung CK", "value": f"`{reference_code}`", "inline": False},
+            ],
+        )
+    except Exception as log_error:
+        print(f"[Wallet Discord Log] {log_error}")
+
+    try:
         wdb.add_log(
             "Duyệt nạp ví",
             f"{transaction_code} — {username} — {_money(amount)}",
@@ -975,6 +1043,21 @@ def mark_wallet_deposit_completed(transaction_code):
     except Exception as error:
         dm_error = str(error)
 
+    try:
+        _send_wallet_web_log(
+            "🔵 Xác nhận đã cộng tiền thủ công",
+            0x3498DB,
+            [
+                {"name": "👤 Khách hàng", "value": f"{username or 'Không rõ'}\n`{discord_id}`", "inline": False},
+                {"name": "👑 Người xác nhận", "value": session.get("display", "Web"), "inline": False},
+                {"name": "💰 Số tiền yêu cầu", "value": f"**{_money(amount)}**", "inline": True},
+                {"name": "💳 Số dư hiện tại", "value": f"**{_money(current_balance)}**", "inline": True},
+                {"name": "🧾 Mã giao dịch", "value": f"`{transaction_code}`", "inline": False},
+            ],
+        )
+    except Exception as log_error:
+        print(f"[Wallet Discord Log] {log_error}")
+
     if dm_error:
         flash(
             f"✅ Đã đánh dấu hoàn tất, nhưng không DM được khách: {dm_error}",
@@ -1085,6 +1168,22 @@ def reject_wallet_deposit(transaction_code):
         )
     except Exception as error:
         dm_error = str(error)
+
+    try:
+        _send_wallet_web_log(
+            "🔴 Từ chối yêu cầu nạp tiền",
+            0xE74C3C,
+            [
+                {"name": "👤 Khách hàng", "value": f"`{discord_id}`", "inline": False},
+                {"name": "👑 Người từ chối", "value": session.get("display", "Web"), "inline": False},
+                {"name": "💰 Số tiền", "value": f"**{_money(amount)}**", "inline": True},
+                {"name": "🧾 Mã giao dịch", "value": f"`{transaction_code}`", "inline": True},
+                {"name": "📝 Nội dung CK", "value": f"`{reference_code}`", "inline": False},
+                {"name": "📌 Lý do", "value": reject_reason[:1024], "inline": False},
+            ],
+        )
+    except Exception as log_error:
+        print(f"[Wallet Discord Log] {log_error}")
 
     if dm_error:
         flash(
@@ -1387,5 +1486,4 @@ if __name__ == "__main__":
     wdb.init_web_db()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
-
 

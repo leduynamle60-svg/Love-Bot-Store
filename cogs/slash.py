@@ -138,6 +138,53 @@ def money_fmt(amount: int) -> str:
     return f"{int(amount):,}".replace(",", ".") + " VNĐ"
 
 
+async def send_wallet_log(
+    bot: commands.Bot,
+    *,
+    title: str,
+    color: int,
+    fields: list[tuple[str, str, bool]],
+    description: str | None = None,
+):
+    """Gửi embed log ví; lỗi log không làm hỏng giao dịch chính."""
+    channel_id = int(
+        getattr(config, "WALLET_LOG_CHANNEL_ID", 0)
+        or os.getenv("WALLET_LOG_CHANNEL_ID", "0")
+        or 0
+    )
+    if not channel_id:
+        print("[Wallet Log] Chưa cấu hình WALLET_LOG_CHANNEL_ID")
+        return False
+
+    try:
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            channel = await bot.fetch_channel(channel_id)
+
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            color=color,
+            timestamp=datetime.now(),
+        )
+        for field_name, field_value, inline in fields:
+            embed.add_field(
+                name=str(field_name)[:256],
+                value=str(field_value)[:1024] or "—",
+                inline=inline,
+            )
+
+        embed.set_footer(text=getattr(config, "BOT_FOOTER", "Love Store"))
+        await channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return True
+    except Exception as error:
+        print(f"[Wallet Log] {type(error).__name__}: {error}")
+        return False
+
+
 def ticket_number_from_channel(channel: discord.TextChannel) -> str:
     name = channel.name
     parts = name.rsplit("-", 1)
@@ -1195,6 +1242,19 @@ class SlashCog(commands.Cog):
             embed.set_footer(text=config.BOT_FOOTER)
 
             await interaction.followup.send(embed=embed, ephemeral=True)
+
+            await send_wallet_log(
+                self.bot,
+                title="🟡 Yêu cầu nạp tiền mới",
+                color=0xF1C40F,
+                fields=[
+                    ("👤 Người yêu cầu", f"{interaction.user.mention}\n`{interaction.user.id}`", False),
+                    ("💰 Số tiền", f"**{money_fmt(amount_value)}**", True),
+                    ("🧾 Mã yêu cầu", f"`{request['transaction_code']}`", True),
+                    ("📝 Nội dung chuyển khoản", f"`{reference_code}`", False),
+                    ("📌 Trạng thái", "⏳ Đang chờ Founder duyệt", False),
+                ],
+            )
         except ValueError as error:
             await interaction.followup.send(
                 f"❌ Số tiền không hợp lệ: {error}",
@@ -1265,6 +1325,25 @@ class SlashCog(commands.Cog):
             embed.set_footer(text=f"Thực hiện bởi {interaction.user}")
 
             await interaction.followup.send(embed=embed, ephemeral=True)
+
+            await send_wallet_log(
+                self.bot,
+                title="🟢 Founder cộng tiền vào ví",
+                color=0x2ECC71,
+                fields=[
+                    ("👑 Người thực hiện", f"{interaction.user.mention}\n`{interaction.user.id}`", False),
+                    ("👤 Người nhận", f"{member.mention}\n`{member.id}`", False),
+                    ("➕ Số tiền", f"**{money_fmt(amount_value)}**", True),
+                    (
+                        "💳 Biến động số dư",
+                        f"{money_fmt(result['balance_before'])} → "
+                        f"**{money_fmt(result['balance_after'])}**",
+                        False,
+                    ),
+                    ("📝 Lý do", reason[:1024], False),
+                    ("🧾 Mã giao dịch", f"`{result['transaction_code']}`", True),
+                ],
+            )
         except ValueError as error:
             await interaction.followup.send(f"❌ {error}", ephemeral=True)
         except Exception as error:
@@ -1348,6 +1427,25 @@ class SlashCog(commands.Cog):
             embed.set_footer(text=f"Thực hiện bởi {interaction.user}")
 
             await interaction.followup.send(embed=embed, ephemeral=True)
+
+            await send_wallet_log(
+                self.bot,
+                title="🟠 Đã trừ tiền trong ví",
+                color=0xE67E22,
+                fields=[
+                    ("👮 Người thực hiện", f"{interaction.user.mention}\n`{interaction.user.id}`", False),
+                    ("👤 Người bị trừ", f"{member.mention}\n`{member.id}`", False),
+                    ("➖ Số tiền", f"**{money_fmt(amount_value)}**", True),
+                    (
+                        "💳 Biến động số dư",
+                        f"{money_fmt(result['balance_before'])} → "
+                        f"**{money_fmt(result['balance_after'])}**",
+                        False,
+                    ),
+                    ("📝 Lý do", reason[:1024], False),
+                    ("🧾 Mã giao dịch", f"`{result['transaction_code']}`", True),
+                ],
+            )
         except ValueError as error:
             if str(error) == "INSUFFICIENT_BALANCE":
                 wallet = db.get_wallet(member.id, member.display_name)
