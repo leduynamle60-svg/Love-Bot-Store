@@ -23,7 +23,7 @@ class AdminCog(commands.Cog):
     @commands.command(name="help")
     async def help_store(self, ctx):
         embed = discord.Embed(
-            title="📖 Love Bot Store — Danh sách lệnh",
+            title="📖 Love Store — Danh sách lệnh",
             color=config.COLOR_PRIMARY
         )
         embed.add_field(
@@ -74,7 +74,7 @@ class AdminCog(commands.Cog):
         conn.close()
 
         embed = discord.Embed(
-            title="📊 Thống Kê Love Bot Store",
+            title="📊 Thống Kê Love Store",
             color=config.COLOR_INFO,
             timestamp=datetime.now()
         )
@@ -146,7 +146,7 @@ class AdminCog(commands.Cog):
     @commands.command(name="web")
     async def cmd_web(self, ctx):
         embed = discord.Embed(
-            title="🌐 Love Bot Store — Web Dashboard",
+            title="🌐 Love Store — Web Dashboard",
             description=(
                 "Truy cập web dashboard tại link bên dưới:\n\n"
                 "🔗 **Local:** http://localhost:10000\n"

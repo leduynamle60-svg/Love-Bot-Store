@@ -49,8 +49,8 @@ TICKET_PREFIX        = "ticket"
 MAX_TICKETS_PER_USER = 1
 
 # --- Bot ---
-BOT_NAME   = "Love Bot Store"
-BOT_FOOTER = "Love Bot Store • Mua hàng uy tín 💖"
+BOT_NAME   = "Love Store"
+BOT_FOOTER = "Love Store • Mua hàng uy tín 💖"
 BOT_AVATAR = ""
 
 ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID"))  # Role Admin trên Discord

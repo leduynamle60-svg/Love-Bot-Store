@@ -1589,14 +1589,29 @@ class SlashCog(commands.Cog):
             embed.description = "Chưa có mã nào!"
         else:
             for row in rows:
-                status = "✅ Còn" if not row["used"] else "❌ Đã dùng"
+                usage_count = int(row.get("usage_count") or 0)
                 amount = f"{row['amount']:,}".replace(",", ".")
+
+                expires_at = row.get("expires_at")
+                is_expired = False
+                if expires_at:
+                    try:
+                        expiry = datetime.strptime(
+                            str(expires_at)[:10],
+                            "%Y-%m-%d",
+                        )
+                        is_expired = datetime.now() > expiry
+                    except ValueError:
+                        pass
+
+                status = "❌ Hết hạn" if is_expired else "✅ Đang hoạt động"
 
                 embed.add_field(
                     name=f"`{row['code']}`",
                     value=(
                         f"💰 Giảm: **{amount} VNĐ**\n"
                         f"📅 HH: {row['expires_at'] or 'Không giới hạn'}\n"
+                        f"👥 Đã dùng: **{usage_count} lượt**\n"
                         f"📌 {status}"
                     ),
                     inline=True

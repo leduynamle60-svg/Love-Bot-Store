@@ -37,7 +37,7 @@ def verify_sepay(payload: str, signature: str) -> bool:
 def sepay_webhook():
     """
     SePay gọi endpoint này khi có tiền vào tài khoản.
-    Payload mẫu: { "id": ..., "transferAmount": 50000, "description": "LBS-ABC123", ... }
+    Payload mẫu: { "id": ..., "transferAmount": 50000, "description": "LS-ABC123", ... }
     """
     data      = request.json or {}
     raw_body  = request.get_data(as_text=True)
@@ -50,9 +50,9 @@ def sepay_webhook():
     amount      = int(data.get("transferAmount", 0))
     description = data.get("description", "").upper()
 
-    # Tìm mã đơn trong nội dung CK (dạng LBS-XXXXXX)
+    # Tìm mã đơn trong nội dung CK (dạng LS-XXXXXX)
     import re
-    match = re.search(r"LBS-[A-Z0-9]{6}", description)
+    match = re.search(r"LS-[A-Z0-9]{6}", description)
     if not match:
         return jsonify({"success": True, "message": "No order code found"}), 200
 

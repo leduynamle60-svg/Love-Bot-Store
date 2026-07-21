@@ -133,7 +133,7 @@ def dashboard():
 
 def _generate_order_code():
     while True:
-        code = "LBS-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        code = "LS-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
         if not db.order_exists(code):
             return code
 
@@ -388,6 +388,157 @@ def _edit_discord_channel_embed(channel_id, message_id, embed):
         raise RuntimeError(
             f"Không sửa được wallet log: HTTP {error.code} — {detail[:300]}"
         ) from error
+
+
+
+def _find_wallet_log_message(channel_id, transaction_code, limit=100):
+    """
+    Tìm message log ví cũ bằng mã giao dịch trong tối đa `limit` tin gần nhất.
+
+    Dùng để cứu các yêu cầu cũ chưa được lưu log_message_id.
+    Trả về message_id hoặc None.
+    """
+    token = _discord_bot_token()
+    if not token:
+        raise RuntimeError("Chưa cấu hình DISCORD_BOT_TOKEN hoặc BOT_TOKEN")
+
+    channel_id = int(channel_id or 0)
+    if not channel_id:
+        raise RuntimeError("Chưa cấu hình WALLET_LOG_CHANNEL_ID")
+
+    req = urllib.request.Request(
+        (
+            f"https://discord.com/api/v10/channels/{channel_id}/messages"
+            f"?limit={max(1, min(int(limit), 100))}"
+        ),
+        headers={
+            "Authorization": f"Bot {token}",
+            "User-Agent": "LoveBotStore-Web/1.0",
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            messages = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Không đọc được wallet log: HTTP {error.code} — {detail[:300]}"
+        ) from error
+
+    needle = str(transaction_code).strip().upper()
+
+    for message in messages:
+        # Chỉ sửa message do chính bot hiện tại gửi.
+        author = message.get("author") or {}
+        if not author.get("bot"):
+            continue
+
+        searchable_parts = [message.get("content") or ""]
+
+        for embed in message.get("embeds") or []:
+            searchable_parts.append(embed.get("title") or "")
+            searchable_parts.append(embed.get("description") or "")
+
+            for field in embed.get("fields") or []:
+                searchable_parts.append(field.get("name") or "")
+                searchable_parts.append(field.get("value") or "")
+
+        searchable_text = "\n".join(searchable_parts).upper()
+        if needle in searchable_text:
+            return int(message["id"])
+
+    return None
+
+
+def _edit_or_recover_wallet_log(
+    transaction_code,
+    log_channel_id,
+    log_message_id,
+    updated_embed,
+):
+    """
+    Ưu tiên sửa đúng message đã lưu.
+
+    Nếu ID bị thiếu hoặc message cũ không còn đúng ID:
+    - quét các tin gần nhất trong kênh log;
+    - tìm embed chứa transaction_code;
+    - sửa embed đó;
+    - lưu lại channel/message ID vào database.
+
+    Chỉ khi hoàn toàn không tìm thấy message cũ mới gửi log mới.
+    """
+    configured_channel_id = int(
+        getattr(config, "WALLET_LOG_CHANNEL_ID", 0)
+        or os.getenv("WALLET_LOG_CHANNEL_ID", "0")
+        or 0
+    )
+
+    channel_id = int(log_channel_id or configured_channel_id or 0)
+    message_id = int(log_message_id or 0)
+
+    if not channel_id:
+        raise RuntimeError("Chưa cấu hình WALLET_LOG_CHANNEL_ID")
+
+    # Trường hợp DB đã lưu đủ ID.
+    if message_id:
+        try:
+            _edit_discord_channel_embed(
+                channel_id,
+                message_id,
+                updated_embed,
+            )
+            return {
+                "edited": True,
+                "channel_id": channel_id,
+                "message_id": message_id,
+                "recovered": False,
+            }
+        except Exception as error:
+            print(
+                "[Wallet Discord Log] ID cũ không sửa được, "
+                f"đang tìm lại message: {error}"
+            )
+
+    # Cứu các giao dịch cũ bị NULL message_id hoặc ID sai.
+    recovered_message_id = _find_wallet_log_message(
+        channel_id,
+        transaction_code,
+    )
+
+    if recovered_message_id:
+        _edit_discord_channel_embed(
+            channel_id,
+            recovered_message_id,
+            updated_embed,
+        )
+        db.save_wallet_log_message(
+            transaction_code,
+            channel_id,
+            recovered_message_id,
+        )
+        return {
+            "edited": True,
+            "channel_id": channel_id,
+            "message_id": recovered_message_id,
+            "recovered": True,
+        }
+
+    # Không tìm thấy log cũ: lúc này mới gửi message mới.
+    _send_wallet_web_log(
+        updated_embed["title"],
+        updated_embed["color"],
+        updated_embed["fields"],
+        updated_embed.get("description"),
+    )
+    return {
+        "edited": False,
+        "channel_id": channel_id,
+        "message_id": None,
+        "recovered": False,
+    }
+
 
 
 def _wallet_log_embed(title, color, fields):
@@ -967,18 +1118,12 @@ def approve_wallet_deposit(transaction_code):
             ],
         )
 
-        if log_channel_id and log_message_id:
-            _edit_discord_channel_embed(
-                log_channel_id,
-                log_message_id,
-                updated_embed,
-            )
-        else:
-            _send_wallet_web_log(
-                updated_embed["title"],
-                updated_embed["color"],
-                updated_embed["fields"],
-            )
+        _edit_or_recover_wallet_log(
+            transaction_code,
+            log_channel_id,
+            log_message_id,
+            updated_embed,
+        )
     except Exception as log_error:
         print(f"[Wallet Discord Log] {log_error}")
 
@@ -1255,18 +1400,12 @@ def reject_wallet_deposit(transaction_code):
             ],
         )
 
-        if log_channel_id and log_message_id:
-            _edit_discord_channel_embed(
-                log_channel_id,
-                log_message_id,
-                updated_embed,
-            )
-        else:
-            _send_wallet_web_log(
-                updated_embed["title"],
-                updated_embed["color"],
-                updated_embed["fields"],
-            )
+        _edit_or_recover_wallet_log(
+            transaction_code,
+            log_channel_id,
+            log_message_id,
+            updated_embed,
+        )
     except Exception as log_error:
         print(f"[Wallet Discord Log] {log_error}")
 
@@ -1571,5 +1710,3 @@ if __name__ == "__main__":
     wdb.init_web_db()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
-
-

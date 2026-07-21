@@ -231,7 +231,6 @@ class OrderCog(commands.Cog):
                 color=config.COLOR_SUCCESS
             )
             await ctx.send(embed=confirm)
-            await ctx.message.delete()
 
         except Exception as e:
             import traceback
@@ -338,12 +337,20 @@ class OrderCog(commands.Cog):
             embed.add_field(name="⚠️ Lưu ý",
                             value="Giữ nguyên nội dung chuyển khoản để hệ thống xác nhận tự động!",
                             inline=False)
-            embed.set_image(url=qr_url)
+            embed.add_field(
+                name="🧭 Cách thanh toán",
+                value=(
+                    "• Có mã giảm giá: bấm **🎟️ Áp mã giảm giá** trước.\n"
+                    "• Dùng số dư: bấm **👛 Thanh toán bằng ví**.\n"
+                    "• Chuyển khoản: bấm **🏦 Lấy mã QR**."
+                ),
+                inline=False,
+            )
             embed.set_footer(text=config.BOT_FOOTER)
 
             view = PaymentView(order_code, amount)
-            await ctx.send(embed=embed, view=view)
-            await ctx.message.delete()
+            payment_message = await ctx.send(embed=embed, view=view)
+            view.message = payment_message
 
         except Exception as e:
             import traceback
@@ -729,125 +736,725 @@ class OrderCog(commands.Cog):
             await ctx.send("❌ Thiếu số tiền!\nVD: `!qr 20k`, `!qr 1m`, `!qr 50000`", delete_after=8)
 
 
-class PaymentView(discord.ui.View):
-    """Nút thanh toán trong ticket: xác nhận đã chuyển + mã giảm giá."""
+class WalletConfirmView(discord.ui.View):
+    """Bước xác nhận cuối trước khi trừ tiền trong ví."""
 
-    def __init__(self, order_code: str, original_amount: int):
-        super().__init__(timeout=300)
-        self.order_code      = order_code
-        self.original_amount = original_amount
-        self.discounted      = False
+    def __init__(self, parent_view, buyer_id: int, amount: int):
+        super().__init__(timeout=60)
+        self.parent_view = parent_view
+        self.buyer_id = int(buyer_id)
+        self.amount = int(amount)
+        self.finished = False
 
-    @discord.ui.button(label="✅ Xác nhận đã thanh toán", style=discord.ButtonStyle.success, custom_id="confirm_payment")
-    async def confirm_payment(self, interaction: discord.Interaction, button: discord.ui.Button):
-        order_info = db.get_order_by_channel(interaction.channel.id)
+    @discord.ui.button(
+        label="✅ Xác nhận thanh toán",
+        style=discord.ButtonStyle.success,
+        custom_id="wallet_confirm_payment",
+    )
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if interaction.user.id != self.buyer_id:
+            return await interaction.response.send_message(
+                "❌ Chỉ người mua của đơn này mới được xác nhận!",
+                ephemeral=True,
+            )
+
+        if self.finished:
+            return await interaction.response.send_message(
+                "⚠️ Yêu cầu này đã được xử lý rồi.",
+                ephemeral=True,
+            )
+
+        self.finished = True
+        for child in self.children:
+            child.disabled = True
+
+        await interaction.response.edit_message(view=self)
+
+        try:
+            result = await asyncio.to_thread(
+                db.pay_order_with_wallet,
+                self.parent_view.order_code,
+                interaction.user.id,
+                str(interaction.user),
+            )
+        except PermissionError:
+            self.finished = False
+            return await interaction.followup.send(
+                "❌ Bạn không phải người mua của đơn này!",
+                ephemeral=True,
+            )
+        except ValueError as error:
+            self.finished = False
+            error_text = str(error)
+
+            if error_text.startswith("INSUFFICIENT_BALANCE:"):
+                _, balance, needed = error_text.split(":", 2)
+                balance = int(balance)
+                needed = int(needed)
+                missing = max(0, needed - balance)
+
+                return await interaction.followup.send(
+                    "❌ **Số dư ví không đủ!**\n\n"
+                    f"💳 Số dư hiện tại: **{balance:,} VNĐ**\n"
+                    f"🧾 Cần thanh toán: **{needed:,} VNĐ**\n"
+                    f"📉 Còn thiếu: **{missing:,} VNĐ**".replace(",", "."),
+                    ephemeral=True,
+                )
+
+            messages = {
+                "ORDER_NOT_FOUND": "❌ Không tìm thấy đơn hàng này.",
+                "ORDER_ALREADY_PAID": "⚠️ Đơn này đã được thanh toán trước đó.",
+                "ORDER_CANCELLED": "❌ Đơn này đã bị hủy.",
+                "INVALID_ORDER_AMOUNT": "❌ Số tiền của đơn không hợp lệ.",
+            }
+            return await interaction.followup.send(
+                messages.get(error_text, f"❌ Không thể thanh toán: `{error_text}`"),
+                ephemeral=True,
+            )
+        except Exception as error:
+            self.finished = False
+            import traceback
+            traceback.print_exc()
+            return await interaction.followup.send(
+                f"❌ Lỗi thanh toán ví: `{type(error).__name__}: {error}`",
+                ephemeral=True,
+            )
+
+        # Thanh toán thành công: khóa toàn bộ nút ở embed gốc.
+        self.parent_view.paid = True
+        for child in self.parent_view.children:
+            child.disabled = True
+
+        order_info = await asyncio.to_thread(
+            db.get_order_by_channel,
+            interaction.channel.id,
+        )
         product_slug = get_product_slug(order_info, interaction.channel)
         ticket_number = get_ticket_number(interaction.channel)
 
-        await safe_rename_ticket(interaction.channel, f"cho-xu-li-{product_slug}-{ticket_number}")
-
-        embed = discord.Embed(
-            title="⏳ Khách đã xác nhận thanh toán",
-            description=(
-                f"{interaction.user.mention} đã bấm **Xác nhận đã thanh toán**.\n"
-                "Staff vui lòng kiểm tra ngân hàng rồi xử lý đơn nhé."
-            ),
-            color=config.COLOR_WARNING,
-            timestamp=datetime.now()
+        await safe_rename_ticket(
+            interaction.channel,
+            f"cho-xu-li-{product_slug}-{ticket_number}",
         )
-        embed.add_field(name="🧾 Mã đơn", value=f"`{self.order_code}`", inline=True)
-        embed.add_field(name="📁 Ticket", value=interaction.channel.mention, inline=True)
-        embed.set_footer(text=config.BOT_FOOTER)
 
-        await interaction.response.send_message(embed=embed)
+        amount_fmt = f"{result['amount']:,}".replace(",", ".")
+        before_fmt = f"{result['balance_before']:,}".replace(",", ".")
+        after_fmt = f"{result['balance_after']:,}".replace(",", ".")
 
-    @discord.ui.button(label="🎟️ Nhập mã giảm giá", style=discord.ButtonStyle.secondary, custom_id="enter_discount")
-    async def enter_discount(self, interaction: discord.Interaction, button: discord.ui.Button):
+        success = discord.Embed(
+            title="✅ Thanh toán bằng ví thành công",
+            description=(
+                f"{interaction.user.mention} đã thanh toán đơn bằng "
+                "**Ví Love Store**.\n"
+                "Staff có thể bắt đầu xử lý và giao sản phẩm."
+            ),
+            color=config.COLOR_SUCCESS,
+            timestamp=datetime.now(),
+        )
+        success.add_field(
+            name="🧾 Mã đơn",
+            value=f"`{self.parent_view.order_code}`",
+            inline=True,
+        )
+        success.add_field(
+            name="💰 Đã thanh toán",
+            value=f"**{amount_fmt} VNĐ**",
+            inline=True,
+        )
+        success.add_field(
+            name="👛 Số dư ví",
+            value=f"{before_fmt} → **{after_fmt} VNĐ**",
+            inline=False,
+        )
+        success.add_field(
+            name="🔖 Mã giao dịch ví",
+            value=f"`{result['transaction_code']}`",
+            inline=True,
+        )
+
+        if result.get("discount_code"):
+            saved_fmt = f"{result['discount_amount']:,}".replace(",", ".")
+            success.add_field(
+                name="🎟️ Mã giảm giá",
+                value=(
+                    f"`{result['discount_code']}` "
+                    f"(-{saved_fmt} VNĐ)"
+                ),
+                inline=True,
+            )
+
+        success.set_footer(text=config.BOT_FOOTER)
+
+        await interaction.followup.send(
+            embed=success,
+            allowed_mentions=discord.AllowedMentions(
+                users=True,
+                roles=False,
+                everyone=False,
+            ),
+        )
+
+        # Cố gắng sửa view của tin nhắn thanh toán gốc.
+        if self.parent_view.message:
+            try:
+                await self.parent_view.message.edit(view=self.parent_view)
+            except discord.HTTPException:
+                pass
+
+        self.stop()
+        self.parent_view.stop()
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ):
+        import traceback
+
+        print(
+            "[WalletConfirmView Error] "
+            f"button={getattr(item, 'custom_id', 'unknown')} "
+            f"user={getattr(interaction.user, 'id', 'unknown')} "
+            f"channel={interaction.channel_id}"
+        )
+        traceback.print_exception(
+            type(error),
+            error,
+            error.__traceback__,
+        )
+
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    f"❌ Lỗi xác nhận ví: "
+                    f"`{type(error).__name__}: {error}`",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    f"❌ Lỗi xác nhận ví: "
+                    f"`{type(error).__name__}: {error}`",
+                    ephemeral=True,
+                )
+        except Exception:
+            traceback.print_exc()
+
+    @discord.ui.button(
+        label="❌ Hủy",
+        style=discord.ButtonStyle.secondary,
+        custom_id="wallet_cancel_payment",
+    )
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if interaction.user.id != self.buyer_id:
+            return await interaction.response.send_message(
+                "❌ Chỉ người mua mới được hủy xác nhận này.",
+                ephemeral=True,
+            )
+
+        self.finished = True
+        for child in self.children:
+            child.disabled = True
+
+        await interaction.response.edit_message(
+            content="Đã hủy thanh toán bằng ví.",
+            embed=None,
+            view=self,
+        )
+        self.stop()
+
+
+class PaymentView(discord.ui.View):
+    """
+    Nút thanh toán trong ticket.
+
+    Thứ tự hợp lý:
+    1. Áp mã giảm giá (nếu có).
+    2. Chọn ví hoặc lấy QR.
+    3. Nếu chuyển khoản, bấm xác nhận đã chuyển.
+    """
+
+    def __init__(self, order_code: str, original_amount: int):
+        super().__init__(timeout=900)
+        self.order_code = order_code
+        self.original_amount = int(original_amount)
+        self.current_amount = int(original_amount)
+        self.discounted = False
+        self.discount_code = None
+        self.discount_amount = 0
+        self.paid = False
+        self.message = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        try:
+            order_info = await asyncio.to_thread(
+                db.get_order_by_channel,
+                interaction.channel.id,
+            )
+        except Exception:
+            order_info = None
+
+        if not order_info:
+            await interaction.response.send_message(
+                "❌ Không tìm thấy đơn đang hoạt động trong ticket này.",
+                ephemeral=True,
+            )
+            return False
+
+        if int(order_info["user_id"]) != interaction.user.id:
+            await interaction.response.send_message(
+                "❌ Chỉ người mua của đơn này mới dùng được các nút thanh toán!",
+                ephemeral=True,
+            )
+            return False
+
+        if str(order_info.get("status") or "").lower() in (
+            "paid",
+            "done",
+            "cancelled",
+        ):
+            await interaction.response.send_message(
+                "⚠️ Đơn này đã thanh toán, hoàn tất hoặc bị hủy.",
+                ephemeral=True,
+            )
+            return False
+
+        self.current_amount = int(order_info.get("amount") or 0)
+        self.discount_code = order_info.get("discount_code")
+        self.discount_amount = int(order_info.get("discount_amount") or 0)
+        self.discounted = bool(self.discount_code)
+        return True
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ):
+        import traceback
+
+        print(
+            "[PaymentView Error] "
+            f"button={getattr(item, 'custom_id', 'unknown')} "
+            f"user={getattr(interaction.user, 'id', 'unknown')} "
+            f"channel={interaction.channel_id}"
+        )
+        traceback.print_exception(
+            type(error),
+            error,
+            error.__traceback__,
+        )
+
+        message = (
+            "❌ Có lỗi khi xử lý nút: "
+            f"`{type(error).__name__}: {error}`"
+        )
+
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    message,
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    message,
+                    ephemeral=True,
+                )
+        except Exception:
+            traceback.print_exc()
+
+    @discord.ui.button(
+        label="🎟️ Áp mã giảm giá",
+        style=discord.ButtonStyle.secondary,
+        custom_id="enter_discount",
+        row=0,
+    )
+    async def enter_discount(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
         if self.discounted:
             return await interaction.response.send_message(
-                "❌ Đơn này đã áp dụng mã giảm giá rồi!",
-                ephemeral=True
+                f"✅ Đơn này đã áp mã `{self.discount_code}` rồi!",
+                ephemeral=True,
             )
 
         await interaction.response.send_modal(
-            DiscountModal(self.order_code, self.original_amount, self)
+            DiscountModal(
+                self.order_code,
+                self.current_amount,
+                self,
+            )
+        )
+
+    @discord.ui.button(
+        label="👛 Thanh toán bằng ví",
+        style=discord.ButtonStyle.success,
+        custom_id="pay_with_wallet",
+        row=0,
+    )
+    async def pay_with_wallet(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        wallet = await asyncio.to_thread(
+            db.get_wallet,
+            interaction.user.id,
+            str(interaction.user),
+        )
+
+        balance = int(wallet.get("balance") or 0)
+        needed = int(self.current_amount)
+        missing = max(0, needed - balance)
+
+        if balance < needed:
+            return await interaction.followup.send(
+                "❌ **Số dư ví không đủ!**\n\n"
+                f"💳 Số dư hiện tại: **{balance:,} VNĐ**\n"
+                f"🧾 Cần thanh toán: **{needed:,} VNĐ**\n"
+                f"📉 Còn thiếu: **{missing:,} VNĐ**".replace(",", "."),
+                ephemeral=True,
+            )
+
+        amount_fmt = f"{needed:,}".replace(",", ".")
+        balance_fmt = f"{balance:,}".replace(",", ".")
+        after_fmt = f"{balance - needed:,}".replace(",", ".")
+
+        embed = discord.Embed(
+            title="👛 Xác nhận thanh toán bằng ví",
+            description=(
+                "Tiền sẽ được trừ ngay sau khi bạn xác nhận.\n"
+                "Thao tác thành công sẽ không thể tự hoàn tác."
+            ),
+            color=config.COLOR_WARNING,
+            timestamp=datetime.now(),
+        )
+        embed.add_field(
+            name="💰 Giá đơn",
+            value=f"**{amount_fmt} VNĐ**",
+            inline=True,
+        )
+        embed.add_field(
+            name="👛 Số dư hiện tại",
+            value=f"**{balance_fmt} VNĐ**",
+            inline=True,
+        )
+        embed.add_field(
+            name="💳 Số dư sau thanh toán",
+            value=f"**{after_fmt} VNĐ**",
+            inline=False,
+        )
+
+        if self.discount_code:
+            saved_fmt = f"{self.discount_amount:,}".replace(",", ".")
+            embed.add_field(
+                name="🎟️ Mã đang áp dụng",
+                value=f"`{self.discount_code}` (-{saved_fmt} VNĐ)",
+                inline=False,
+            )
+
+        embed.set_footer(text=config.BOT_FOOTER)
+
+        await interaction.followup.send(
+            embed=embed,
+            view=WalletConfirmView(
+                self,
+                interaction.user.id,
+                needed,
+            ),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="🏦 Lấy mã QR",
+        style=discord.ButtonStyle.primary,
+        custom_id="get_payment_qr",
+        row=1,
+    )
+    async def get_payment_qr(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        amount = int(self.current_amount)
+        amount_fmt = f"{amount:,}".replace(",", ".")
+        qr_url = make_qr_url(amount, self.order_code)
+
+        embed = discord.Embed(
+            title="🏦 Mã QR thanh toán",
+            description=(
+                "Quét mã dưới đây và giữ nguyên nội dung chuyển khoản.\n"
+                "Sau khi chuyển xong, bấm **✅ Tôi đã chuyển khoản** "
+                "ở tin nhắn thanh toán."
+            ),
+            color=config.COLOR_PRIMARY,
+            timestamp=datetime.now(),
+        )
+        embed.add_field(
+            name="💰 Số tiền",
+            value=f"**{amount_fmt} VNĐ**",
+            inline=True,
+        )
+        embed.add_field(
+            name="📝 Nội dung CK",
+            value=f"`{self.order_code}`",
+            inline=True,
+        )
+        embed.set_image(url=qr_url)
+        embed.set_footer(text=config.BOT_FOOTER)
+
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="✅ Tôi đã chuyển khoản",
+        style=discord.ButtonStyle.secondary,
+        custom_id="confirm_bank_payment",
+        row=1,
+    )
+    async def confirm_payment(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        order_info = await asyncio.to_thread(
+            db.get_order_by_channel,
+            interaction.channel.id,
+        )
+        product_slug = get_product_slug(order_info, interaction.channel)
+        ticket_number = get_ticket_number(interaction.channel)
+
+        await safe_rename_ticket(
+            interaction.channel,
+            f"cho-xu-li-{product_slug}-{ticket_number}",
+        )
+
+        embed = discord.Embed(
+            title="⏳ Khách đã báo chuyển khoản",
+            description=(
+                f"{interaction.user.mention} đã báo **đã chuyển khoản**.\n"
+                "Staff vui lòng kiểm tra ngân hàng trước khi xử lý đơn."
+            ),
+            color=config.COLOR_WARNING,
+            timestamp=datetime.now(),
+        )
+        embed.add_field(
+            name="🧾 Mã đơn",
+            value=f"`{self.order_code}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="💰 Số tiền cần kiểm tra",
+            value=f"**{self.current_amount:,} VNĐ**".replace(",", "."),
+            inline=True,
+        )
+        embed.add_field(
+            name="📁 Ticket",
+            value=interaction.channel.mention,
+            inline=False,
+        )
+        embed.set_footer(text=config.BOT_FOOTER)
+
+        await interaction.followup.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(
+                users=True,
+                roles=False,
+                everyone=False,
+            ),
         )
 
 
-class DiscountModal(discord.ui.Modal, title="🎟️ Nhập mã giảm giá"):
+class DiscountModal(discord.ui.Modal, title="🎟️ Áp mã giảm giá"):
     code = discord.ui.TextInput(
         label="Mã giảm giá",
         placeholder="VD: SALE10K",
-        max_length=30
+        max_length=30,
     )
 
-    def __init__(self, order_code: str, original_amount: int, view: PaymentView):
+    def __init__(
+        self,
+        order_code: str,
+        current_amount: int,
+        view: PaymentView,
+    ):
         super().__init__()
-        self.order_code      = order_code
-        self.original_amount = original_amount
-        self.parent_view     = view
+        self.order_code = order_code
+        self.current_amount = int(current_amount)
+        self.parent_view = view
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            code     = self.code.value.strip().upper()
-            discount = db.get_discount(code)
+            code = self.code.value.strip().upper()
+            discount = await asyncio.to_thread(
+                db.get_discount,
+                code,
+                interaction.user.id,
+            )
 
             if not discount:
                 return await interaction.response.send_message(
-                    "❌ Mã giảm giá không tồn tại! Hãy kiểm tra lại ký tự của mã.",
-                    ephemeral=True
+                    "❌ Mã không tồn tại hoặc bạn đã sử dụng mã này trước đó!",
+                    ephemeral=True,
                 )
 
-            # Kiểm tra hết hạn
-            if discount["expires_at"]:
-                expires = datetime.strptime(discount["expires_at"], "%Y-%m-%d")
-                if datetime.now() > expires:
-                    return await interaction.response.send_message(
-                        "❌ Mã đã hết hạn!", ephemeral=True
+            expires_at = discount.get("expires_at")
+            if expires_at:
+                if isinstance(expires_at, str):
+                    expires = datetime.strptime(
+                        expires_at[:10],
+                        "%Y-%m-%d",
+                    )
+                else:
+                    expires = datetime.combine(
+                        expires_at,
+                        datetime.min.time(),
                     )
 
-            # Tính giá sau giảm
-            discount_amt = discount["amount"]
-            new_amount   = max(0, self.original_amount - discount_amt)
-            amount_fmt   = f"{new_amount:,}".replace(",", ".")
-            saved_fmt    = f"{discount_amt:,}".replace(",", ".")
+                if datetime.now() > expires:
+                    return await interaction.response.send_message(
+                        "❌ Mã giảm giá đã hết hạn!",
+                        ephemeral=True,
+                    )
 
-            # Mã được dùng chung cho nhiều khách nên không khóa mã tại đây.
-
-            # Cập nhật amount trong DB
-            conn = db.get_conn()
-            cur = conn.cursor()
-            cur.execute(
-                "UPDATE orders SET amount=%s WHERE order_code=%s",
-                (new_amount, self.order_code)
+            result = await asyncio.to_thread(
+                db.apply_order_discount,
+                self.order_code,
+                interaction.user.id,
+                code,
+                int(discount["amount"]),
             )
-            conn.commit()
-            conn.close()
 
-            # Tạo QR mới với giá mới
-            qr_url = make_qr_url(new_amount, self.order_code)
+            self.parent_view.current_amount = result["new_amount"]
+            self.parent_view.discounted = True
+            self.parent_view.discount_code = result["discount_code"]
+            self.parent_view.discount_amount = result["discount_amount"]
+
+            # Khóa nút mã để khách nhìn là biết đã áp.
+            for child in self.parent_view.children:
+                if getattr(child, "custom_id", None) == "enter_discount":
+                    child.disabled = True
+                    child.label = "✅ Đã áp mã"
+                    break
+
+            old_fmt = f"{result['old_amount']:,}".replace(",", ".")
+            saved_fmt = f"{result['discount_amount']:,}".replace(",", ".")
+            new_fmt = f"{result['new_amount']:,}".replace(",", ".")
 
             embed = discord.Embed(
-                title="✅ Áp dụng mã thành công!",
+                title="✅ Áp dụng mã thành công",
+                description=(
+                    "Giá của đơn hàng đã được cập nhật.\n"
+                    "Bây giờ bạn có thể thanh toán bằng ví hoặc lấy QR mới."
+                ),
                 color=config.COLOR_SUCCESS,
-                timestamp=datetime.now()
+                timestamp=datetime.now(),
             )
-            embed.add_field(name="🎟️ Mã",        value=f"`{code}`",              inline=True)
-            embed.add_field(name="💸 Giảm",       value=f"{saved_fmt} VNĐ",      inline=True)
-            embed.add_field(name="💰 Còn lại",    value=f"**{amount_fmt} VNĐ**", inline=True)
-            embed.add_field(name="⚠️ Lưu ý",
-                            value="Quét QR bên dưới để thanh toán số tiền mới nhé!",
-                            inline=False)
-            embed.set_image(url=qr_url)
+            embed.add_field(
+                name="🎟️ Mã",
+                value=f"`{result['discount_code']}`",
+                inline=True,
+            )
+            embed.add_field(
+                name="💰 Giá gốc",
+                value=f"{old_fmt} VNĐ",
+                inline=True,
+            )
+            embed.add_field(
+                name="💸 Được giảm",
+                value=f"**{saved_fmt} VNĐ**",
+                inline=True,
+            )
+            embed.add_field(
+                name="✅ Cần thanh toán",
+                value=f"**{new_fmt} VNĐ**",
+                inline=False,
+            )
             embed.set_footer(text=config.BOT_FOOTER)
 
-            self.parent_view.discounted = True
-            await interaction.response.send_message(embed=embed)
+            await interaction.response.send_message(
+                embed=embed,
+                ephemeral=True,
+            )
 
-        except Exception as e:
+            if self.parent_view.message:
+                try:
+                    await self.parent_view.message.edit(
+                        view=self.parent_view,
+                    )
+                except discord.HTTPException:
+                    pass
+
+        except PermissionError:
+            await interaction.response.send_message(
+                "❌ Chỉ người mua mới được áp mã cho đơn này!",
+                ephemeral=True,
+            )
+        except ValueError as error:
+            messages = {
+                "ORDER_NOT_FOUND": "❌ Không tìm thấy đơn hàng.",
+                "ORDER_ALREADY_CLOSED": (
+                    "⚠️ Đơn đã thanh toán, hoàn tất hoặc bị hủy."
+                ),
+                "DISCOUNT_ALREADY_APPLIED": (
+                    "⚠️ Đơn này đã áp một mã giảm giá rồi."
+                ),
+                "INVALID_DISCOUNT": "❌ Mã giảm giá không hợp lệ.",
+                "DISCOUNT_NOT_FOUND": "❌ Mã giảm giá không tồn tại.",
+                "DISCOUNT_ALREADY_USED_BY_USER": (
+                    "❌ Bạn đã sử dụng mã giảm giá này trước đó."
+                ),
+                "INVALID_DISCOUNT_AMOUNT": (
+                    "❌ Giá trị mã giảm giá không hợp lệ."
+                ),
+            }
+            await interaction.response.send_message(
+                messages.get(str(error), f"❌ Không thể áp mã: `{error}`"),
+                ephemeral=True,
+            )
+        except Exception as error:
             import traceback
             traceback.print_exc()
-            await interaction.response.send_message(f"❌ Lỗi: `{e}`", ephemeral=True)
+
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    f"❌ Lỗi: `{type(error).__name__}: {error}`",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    f"❌ Lỗi: `{type(error).__name__}: {error}`",
+                    ephemeral=True,
+                )
 
 
 class TipView(discord.ui.View):

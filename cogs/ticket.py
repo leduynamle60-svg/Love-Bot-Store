@@ -13,9 +13,11 @@ from discord.ext import commands
 import config
 import database as db
 
+MAX_OPEN_TICKETS_PER_USER = 3
+
 
 def gen_order_code() -> str:
-    return "LBS-" + "".join(
+    return "LS-" + "".join(
         random.choices(string.ascii_uppercase + string.digits, k=6)
     )
 
@@ -67,10 +69,10 @@ class OpenTicketView(discord.ui.View):
                     ephemeral=True,
                 )
 
-            if db.count_open_tickets(member.id) >= config.MAX_TICKETS_PER_USER:
+            if db.count_open_tickets(member.id) >= MAX_OPEN_TICKETS_PER_USER:
                 return await interaction.followup.send(
-                    "❌ Bạn đang có ticket chưa xử lý. "
-                    "Vui lòng chờ Support hoàn tất đơn cũ!",
+                    "❌ Bạn đã mở đủ **3 ticket** cùng lúc. "
+                    "Hãy đóng bớt một ticket trước khi tạo ticket mới!",
                     ephemeral=True,
                 )
 
@@ -204,10 +206,10 @@ class OpenSupportView(discord.ui.View):
                     ephemeral=True,
                 )
 
-            if db.count_open_tickets(member.id) >= config.MAX_TICKETS_PER_USER:
+            if db.count_open_tickets(member.id) >= MAX_OPEN_TICKETS_PER_USER:
                 return await interaction.followup.send(
-                    "❌ Bạn đang có ticket chưa xử lý. "
-                    "Vui lòng chờ Support hoàn tất!",
+                    "❌ Bạn đã mở đủ **3 ticket** cùng lúc. "
+                    "Hãy đóng bớt một ticket trước khi tạo ticket mới!",
                     ephemeral=True,
                 )
 

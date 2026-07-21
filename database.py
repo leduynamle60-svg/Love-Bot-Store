@@ -2,7 +2,12 @@
 database.py — PostgreSQL/Supabase cho Love Bot Store
 """
 
+import config as app_config
 import os
+import json
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
 
 import psycopg2
 import psycopg2.extras
@@ -11,6 +16,139 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+
+
+def _money_text(value):
+    return f"{int(value or 0):,}".replace(",", ".") + " VNĐ"
+
+
+def _send_wallet_purchase_log(result, discord_id, username):
+    """
+    Gửi log khi khách thanh toán đơn bằng ví.
+
+    Lỗi Discord chỉ được ghi ra console, không rollback khoản thanh toán
+    đã commit thành công.
+    """
+
+    token = str(
+        os.getenv("DISCORD_BOT_TOKEN")
+        or os.getenv("BOT_TOKEN")
+        or app_config.BOT_TOKEN
+        or ""
+    ).strip()
+
+    channel_id = str(
+        os.getenv("WALLET_LOG_CHANNEL_ID")
+        or app_config.WALLET_LOG_CHANNEL_ID
+        or ""
+    ).strip()
+
+    if not token or not channel_id:
+        print(
+            "[Wallet Purchase Log] Bỏ qua vì thiếu BOT_TOKEN/"
+            "DISCORD_BOT_TOKEN hoặc WALLET_LOG_CHANNEL_ID"
+        )
+        return False
+
+    product_name = result.get("product_name") or "Không rõ"
+    reason = f"Mua hàng: {product_name}"
+
+    fields = [
+        {
+            "name": "👤 Khách hàng",
+            "value": f"<@{int(discord_id)}>\n`{int(discord_id)}`",
+            "inline": False,
+        },
+        {
+            "name": "🛍️ Sản phẩm",
+            "value": product_name,
+            "inline": False,
+        },
+        {
+            "name": "💸 Số tiền đã trừ",
+            "value": f"**{_money_text(result.get('amount'))}**",
+            "inline": True,
+        },
+        {
+            "name": "🧾 Mã đơn",
+            "value": f"`{result.get('order_code')}`",
+            "inline": True,
+        },
+        {
+            "name": "🔖 Mã giao dịch ví",
+            "value": f"`{result.get('transaction_code')}`",
+            "inline": True,
+        },
+        {
+            "name": "📝 Lý do",
+            "value": reason,
+            "inline": False,
+        },
+        {
+            "name": "💳 Biến động số dư",
+            "value": (
+                f"{_money_text(result.get('balance_before'))} → "
+                f"**{_money_text(result.get('balance_after'))}**"
+            ),
+            "inline": False,
+        },
+        {
+            "name": "📌 Trạng thái",
+            "value": "✅ Thanh toán bằng ví thành công",
+            "inline": False,
+        },
+    ]
+
+    if result.get("discount_code"):
+        fields.insert(
+            4,
+            {
+                "name": "🎟️ Mã giảm giá",
+                "value": (
+                    f"`{result['discount_code']}` "
+                    f"(-{_money_text(result.get('discount_amount'))})"
+                ),
+                "inline": True,
+            },
+        )
+
+    payload = json.dumps({
+        "embeds": [{
+            "title": "🟣 Thanh toán đơn hàng bằng ví",
+            "description": (
+                f"{username or 'Khách hàng'} đã dùng số dư ví "
+                "để thanh toán đơn hàng."
+            ),
+            "color": 0x9B59B6,
+            "fields": fields,
+            "footer": {"text": "Love Bot Store • Mua hàng uy tín 💖"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }],
+        "allowed_mentions": {"parse": []},
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        f"https://discord.com/api/v10/channels/{int(channel_id)}/messages",
+        data=payload,
+        headers={
+            "Authorization": f"Bot {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "LoveBotStore/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return response.status in (200, 201)
+    except Exception as error:
+        print(
+            "[Wallet Purchase Log] Không gửi được log: "
+            f"{type(error).__name__}: {error}"
+        )
+        return False
+
 
 
 def get_conn():
@@ -51,6 +189,9 @@ def init_db():
             support_name          TEXT,
             processor_discord_id  TEXT,
             processor_name        TEXT,
+            payment_method        TEXT,
+            discount_code         TEXT,
+            discount_amount       INTEGER NOT NULL DEFAULT 0,
             created_at            TIMESTAMP DEFAULT NOW(),
             paid_at               TIMESTAMP
         )
@@ -62,6 +203,12 @@ def init_db():
     cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS support_name TEXT")
     cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS processor_discord_id TEXT")
     cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS processor_name TEXT")
+    cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT")
+    cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_code TEXT")
+    cur.execute(
+        "ALTER TABLE orders "
+        "ADD COLUMN IF NOT EXISTS discount_amount INTEGER NOT NULL DEFAULT 0"
+    )
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS feedbacks (
@@ -133,9 +280,22 @@ def init_db():
         )
     """)
 
-    # Mã giảm giá hiện dùng chung cho nhiều khách.
-    # Mở lại các mã từng bị cơ chế cũ đánh dấu used=1.
-    cur.execute("UPDATE discount_codes SET used=0 WHERE used<>0")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS discount_redemptions (
+            id             BIGSERIAL PRIMARY KEY,
+            discount_code  TEXT NOT NULL,
+            discord_id     BIGINT NOT NULL,
+            order_code     TEXT NOT NULL,
+            created_at     TIMESTAMP DEFAULT NOW(),
+            UNIQUE(discount_code, discord_id),
+            UNIQUE(order_code)
+        )
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_discount_redemptions_code
+        ON discount_redemptions (discount_code, created_at DESC)
+    """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS order_support (
@@ -711,58 +871,143 @@ def create_discount(code, amount, expires_at=None):
     conn.close()
 
 
-def get_discount(code):
-    """Lấy mã giảm giá đang tồn tại.
+def get_discount(code, discord_id=None):
+    """
+    Lấy mã giảm giá đang tồn tại.
 
-    Mã được phép dùng cho nhiều đơn hàng; việc ngăn áp lặp được xử lý
-    tại PaymentView của từng ticket.
+    Nếu truyền discord_id, hàm sẽ trả None khi người đó đã dùng mã này.
+    Cột used cũ được giữ để tương thích nhưng không còn quyết định trạng thái.
     """
     normalized_code = (code or "").strip().upper()
 
     conn = get_conn_dict()
     try:
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT *
-            FROM discount_codes
-            WHERE UPPER(TRIM(code))=%s
-            """,
-            (normalized_code,),
-        )
+
+        if discord_id is None:
+            cur.execute(
+                """
+                SELECT *
+                FROM discount_codes
+                WHERE UPPER(TRIM(code))=%s
+                """,
+                (normalized_code,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT dc.*
+                FROM discount_codes dc
+                WHERE UPPER(TRIM(dc.code))=%s
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM discount_redemptions dr
+                      WHERE UPPER(TRIM(dr.discount_code))=%s
+                        AND dr.discord_id=%s
+                  )
+                """,
+                (
+                    normalized_code,
+                    normalized_code,
+                    int(discord_id),
+                ),
+            )
+
         return cur.fetchone()
     finally:
         conn.close()
 
 
-def use_discount(code):
-    """Tương thích code cũ.
-
-    Không đánh dấu used=1 nữa vì mã giảm giá được phép dùng cho nhiều khách.
+def use_discount(code, discord_id=None, order_code=None):
     """
-    return True
+    Hàm tương thích.
+
+    Luồng mới dùng apply_order_discount() để ghi nhận lượt dùng atomic.
+    """
+    if discord_id is None or order_code is None:
+        return True
+
+    normalized_code = (code or "").strip().upper()
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO discount_redemptions (
+                discount_code, discord_id, order_code
+            )
+            VALUES (%s, %s, %s)
+            ON CONFLICT (discount_code, discord_id) DO NOTHING
+            """,
+            (
+                normalized_code,
+                int(discord_id),
+                str(order_code),
+            ),
+        )
+
+        if cur.rowcount != 1:
+            raise ValueError("DISCOUNT_ALREADY_USED_BY_USER")
+
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 
 
 def get_all_discounts():
     conn = get_conn_dict()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT * FROM discount_codes ORDER BY created_at DESC"
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return list(rows)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                dc.*,
+                COUNT(dr.id) AS usage_count
+            FROM discount_codes dc
+            LEFT JOIN discount_redemptions dr
+                ON UPPER(TRIM(dr.discount_code)) = UPPER(TRIM(dc.code))
+            GROUP BY dc.id
+            ORDER BY dc.created_at DESC
+            """
+        )
+        return list(cur.fetchall())
+    finally:
+        conn.close()
+
 
 
 def delete_discount(code):
+    normalized_code = (code or "").strip().upper()
+
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "DELETE FROM discount_codes WHERE code=%s",
-        (code.upper(),),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            DELETE FROM discount_redemptions
+            WHERE UPPER(TRIM(discount_code))=%s
+            """,
+            (normalized_code,),
+        )
+        cur.execute(
+            """
+            DELETE FROM discount_codes
+            WHERE UPPER(TRIM(code))=%s
+            """,
+            (normalized_code,),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 
@@ -1079,6 +1324,318 @@ def subtract_wallet_money(
         raise
     finally:
         conn.close()
+
+
+
+def apply_order_discount(
+    order_code,
+    discord_id,
+    code,
+    discount_amount=None,
+):
+    """
+    Mỗi Discord ID chỉ được dùng một mã đúng 1 lần.
+
+    Trong cùng transaction:
+    - khóa đơn;
+    - khóa mã;
+    - kiểm tra người dùng chưa dùng mã;
+    - ghi discount_redemptions;
+    - cập nhật giá đơn.
+    """
+    normalized_code = (code or "").strip().upper()
+
+    if not normalized_code:
+        raise ValueError("INVALID_DISCOUNT")
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT user_id, amount, status, discount_code
+            FROM orders
+            WHERE order_code=%s
+            FOR UPDATE
+            """,
+            (str(order_code),),
+        )
+        order_row = cur.fetchone()
+
+        if not order_row:
+            raise ValueError("ORDER_NOT_FOUND")
+
+        owner_id, current_amount, status, existing_code = order_row
+
+        if int(owner_id) != int(discord_id):
+            raise PermissionError("NOT_ORDER_OWNER")
+
+        if str(status or "").lower() in ("paid", "done", "cancelled"):
+            raise ValueError("ORDER_ALREADY_CLOSED")
+
+        if existing_code:
+            raise ValueError("DISCOUNT_ALREADY_APPLIED")
+
+        cur.execute(
+            """
+            SELECT id, amount, expires_at
+            FROM discount_codes
+            WHERE UPPER(TRIM(code))=%s
+            FOR UPDATE
+            """,
+            (normalized_code,),
+        )
+        discount_row = cur.fetchone()
+
+        if not discount_row:
+            raise ValueError("DISCOUNT_NOT_FOUND")
+
+        discount_id, stored_amount, expires_at = discount_row
+        stored_amount = int(stored_amount or 0)
+
+        if stored_amount <= 0:
+            raise ValueError("INVALID_DISCOUNT_AMOUNT")
+
+        cur.execute(
+            """
+            SELECT 1
+            FROM discount_redemptions
+            WHERE UPPER(TRIM(discount_code))=%s
+              AND discord_id=%s
+            FOR UPDATE
+            """,
+            (normalized_code, int(discord_id)),
+        )
+        if cur.fetchone():
+            raise ValueError("DISCOUNT_ALREADY_USED_BY_USER")
+
+        current_amount = int(current_amount or 0)
+        new_amount = max(0, current_amount - stored_amount)
+        actual_discount = current_amount - new_amount
+
+        try:
+            cur.execute(
+                """
+                INSERT INTO discount_redemptions (
+                    discount_code, discord_id, order_code
+                )
+                VALUES (%s, %s, %s)
+                """,
+                (
+                    normalized_code,
+                    int(discord_id),
+                    str(order_code),
+                ),
+            )
+        except Exception as error:
+            # Unique(discount_code, discord_id) chống hai ticket dùng cùng lúc.
+            if getattr(error, "pgcode", None) == "23505":
+                raise ValueError("DISCOUNT_ALREADY_USED_BY_USER") from error
+            raise
+
+        cur.execute(
+            """
+            UPDATE orders
+            SET amount=%s,
+                discount_code=%s,
+                discount_amount=%s
+            WHERE order_code=%s
+            """,
+            (
+                new_amount,
+                normalized_code,
+                actual_discount,
+                str(order_code),
+            ),
+        )
+
+        conn.commit()
+        return {
+            "order_code": str(order_code),
+            "old_amount": current_amount,
+            "new_amount": new_amount,
+            "discount_code": normalized_code,
+            "discount_amount": actual_discount,
+            "expires_at": expires_at,
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+
+def pay_order_with_wallet(order_code, discord_id, username):
+    """
+    Thanh toán đơn bằng ví trong một PostgreSQL transaction.
+
+    - Khóa đơn hàng.
+    - Khóa ví người mua.
+    - Kiểm tra chủ đơn, trạng thái và số dư.
+    - Trừ ví, tạo wallet transaction, cập nhật đơn paid.
+    - Nếu bất kỳ bước nào lỗi thì rollback toàn bộ.
+    """
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT user_id, product_name, amount, status,
+                   payment_method, discount_code, discount_amount
+            FROM orders
+            WHERE order_code=%s
+            FOR UPDATE
+            """,
+            (str(order_code),),
+        )
+        order_row = cur.fetchone()
+
+        if not order_row:
+            raise ValueError("ORDER_NOT_FOUND")
+
+        (
+            owner_id,
+            product_name,
+            amount,
+            status,
+            payment_method,
+            discount_code,
+            discount_amount,
+        ) = order_row
+
+        if int(owner_id) != int(discord_id):
+            raise PermissionError("NOT_ORDER_OWNER")
+
+        normalized_status = str(status or "").lower()
+        if normalized_status in ("paid", "done"):
+            raise ValueError("ORDER_ALREADY_PAID")
+        if normalized_status == "cancelled":
+            raise ValueError("ORDER_CANCELLED")
+
+        amount = int(amount or 0)
+        if amount < 0:
+            raise ValueError("INVALID_ORDER_AMOUNT")
+
+        # Tạo ví nếu người dùng chưa có.
+        cur.execute(
+            """
+            INSERT INTO wallets (discord_id, username)
+            VALUES (%s, %s)
+            ON CONFLICT (discord_id)
+            DO UPDATE SET
+                username=CASE
+                    WHEN EXCLUDED.username <> '' THEN EXCLUDED.username
+                    ELSE wallets.username
+                END,
+                updated_at=NOW()
+            """,
+            (int(discord_id), username or ""),
+        )
+
+        cur.execute(
+            """
+            SELECT balance
+            FROM wallets
+            WHERE discord_id=%s
+            FOR UPDATE
+            """,
+            (int(discord_id),),
+        )
+        wallet_row = cur.fetchone()
+        before = int(wallet_row[0] or 0)
+
+        if before < amount:
+            raise ValueError(f"INSUFFICIENT_BALANCE:{before}:{amount}")
+
+        after = before - amount
+
+        cur.execute(
+            """
+            UPDATE wallets
+            SET balance=%s,
+                total_spent=total_spent + %s,
+                username=%s,
+                updated_at=NOW()
+            WHERE discord_id=%s
+            """,
+            (after, amount, username or "", int(discord_id)),
+        )
+
+        tx_code, reserved_id = _wallet_tx_code(cur)
+        cur.execute(
+            """
+            INSERT INTO wallet_transactions (
+                id, transaction_code, discord_id, username,
+                transaction_type, amount, reason, reference_code,
+                performed_by, performer_name,
+                balance_before, balance_after, status
+            )
+            VALUES (
+                %s,%s,%s,%s,
+                'order_payment',%s,%s,%s,
+                %s,%s,
+                %s,%s,'completed'
+            )
+            """,
+            (
+                reserved_id,
+                tx_code,
+                int(discord_id),
+                username or "",
+                amount,
+                f"Mua hàng: {product_name or 'Không rõ'}",
+                str(order_code),
+                int(discord_id),
+                username or "",
+                before,
+                after,
+            ),
+        )
+
+        cur.execute(
+            """
+            UPDATE orders
+            SET status='paid',
+                payment_method='wallet',
+                paid_at=NOW()
+            WHERE order_code=%s
+            """,
+            (str(order_code),),
+        )
+
+        conn.commit()
+
+        result = {
+            "transaction_code": tx_code,
+            "order_code": str(order_code),
+            "product_name": product_name or "Không rõ",
+            "amount": amount,
+            "balance_before": before,
+            "balance_after": after,
+            "payment_method": "wallet",
+            "discount_code": discount_code,
+            "discount_amount": int(discount_amount or 0),
+        }
+
+        # Log Discord sau khi DB đã commit để lỗi mạng không làm mất thanh toán.
+        _send_wallet_purchase_log(
+            result,
+            int(discord_id),
+            username or "",
+        )
+
+        return result
+
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 
 
 def get_wallet_history(discord_id, limit=10):
