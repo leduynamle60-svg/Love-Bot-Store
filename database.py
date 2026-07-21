@@ -133,6 +133,10 @@ def init_db():
         )
     """)
 
+    # Mã giảm giá hiện dùng chung cho nhiều khách.
+    # Mở lại các mã từng bị cơ chế cũ đánh dấu used=1.
+    cur.execute("UPDATE discount_codes SET used=0 WHERE used<>0")
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS order_support (
             order_code          TEXT PRIMARY KEY,
@@ -181,9 +185,20 @@ def init_db():
             balance_before    BIGINT NOT NULL DEFAULT 0,
             balance_after     BIGINT NOT NULL DEFAULT 0,
             status            TEXT NOT NULL DEFAULT 'completed',
+            log_channel_id    BIGINT,
+            log_message_id    BIGINT,
             created_at        TIMESTAMP DEFAULT NOW()
         )
     """)
+
+    cur.execute(
+        "ALTER TABLE wallet_transactions "
+        "ADD COLUMN IF NOT EXISTS log_channel_id BIGINT"
+    )
+    cur.execute(
+        "ALTER TABLE wallet_transactions "
+        "ADD COLUMN IF NOT EXISTS log_message_id BIGINT"
+    )
 
     cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_wallet_transactions_discord_id
@@ -697,30 +712,35 @@ def create_discount(code, amount, expires_at=None):
 
 
 def get_discount(code):
+    """Lấy mã giảm giá đang tồn tại.
+
+    Mã được phép dùng cho nhiều đơn hàng; việc ngăn áp lặp được xử lý
+    tại PaymentView của từng ticket.
+    """
+    normalized_code = (code or "").strip().upper()
+
     conn = get_conn_dict()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT *
-        FROM discount_codes
-        WHERE code=%s AND used=0
-        """,
-        (code.upper(),),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT *
+            FROM discount_codes
+            WHERE UPPER(TRIM(code))=%s
+            """,
+            (normalized_code,),
+        )
+        return cur.fetchone()
+    finally:
+        conn.close()
 
 
 def use_discount(code):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE discount_codes SET used=1 WHERE code=%s",
-        (code.upper(),),
-    )
-    conn.commit()
-    conn.close()
+    """Tương thích code cũ.
+
+    Không đánh dấu used=1 nữa vì mã giảm giá được phép dùng cho nhiều khách.
+    """
+    return True
 
 
 def get_all_discounts():
@@ -875,6 +895,30 @@ def create_deposit_request(
         raise
     finally:
         conn.close()
+
+
+
+def save_wallet_log_message(transaction_code, channel_id, message_id):
+    """Lưu vị trí embed log của yêu cầu nạp tiền."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE wallet_transactions
+            SET log_channel_id=%s,
+                log_message_id=%s
+            WHERE transaction_code=%s
+            """,
+            (int(channel_id), int(message_id), str(transaction_code)),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 
 
 def add_wallet_money(

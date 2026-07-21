@@ -1,1489 +1,1640 @@
 """
-web/app.py — Flask Web Dashboard cho Love Bot Store
+cogs/slash.py — Slash commands cho Love Bot Store
 """
-
-from flask import Flask, render_template, redirect, url_for, request, session, flash
-from functools import wraps
+import urllib.parse
+import os
+import secrets
 from datetime import datetime
-import random, string
-import json
-import urllib.request
-import urllib.error
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import database as db
-import web_db as wdb
+import discord
+from discord import app_commands
+from discord.ext import commands
 
-app = Flask(__name__)
 import config
-app.secret_key = config.WEB_SECRET_KEY
-
-
-# ── Decorators ───────────────────────────────────────────────
-
-def login_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if "user_id" not in session:
-            return redirect(url_for("login"))
-        return f(*args, **kwargs)
-    return decorated
-
-
-def role_required(*roles):
-    def decorator(f):
-        @wraps(f)
-        def decorated(*args, **kwargs):
-            if session.get("role") not in roles:
-                flash("❌ Bạn không có quyền truy cập trang này!", "error")
-                return redirect(url_for("dashboard"))
-            return f(*args, **kwargs)
-        return decorated
-    return decorator
-
-
-# ── Auth ─────────────────────────────────────────────────────
-
-@app.route("/", methods=["GET", "POST"])
-def login():
-    if "user_id" in session:
-        return redirect(url_for("dashboard"))
-
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "").strip()
-        user     = wdb.verify_user(username, password)
-
-        if user:
-            session["user_id"]  = user["id"]
-            session["username"] = user["username"]
-            session["role"]     = user["role"]
-            session["display"]  = user["display_name"]
-            return redirect(url_for("dashboard"))
-        else:
-            flash("❌ Sai tên đăng nhập hoặc mật khẩu!", "error")
-
-    return render_template("login.html")
-
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
-
-
-# ── Dashboard ─────────────────────────────────────────────────
-
-@app.route("/dashboard")
-@login_required
-def dashboard():
-    if session["role"] == "support":
-        return redirect(url_for("my_orders"))
-
-    conn = db.get_conn_dict()
-    c    = conn.cursor()
-
-    def q(sql):
-        c.execute(sql)
-        row = c.fetchone()
-        return list(row.values())[0] if row else 0
-
-    stats = {
-        "total":     q("SELECT COUNT(*) FROM orders"),
-        "done":      q("SELECT COUNT(*) FROM orders WHERE status='done'"),
-        "pending":   q("SELECT COUNT(*) FROM orders WHERE status NOT IN ('done','cancelled')"),
-        "cancelled": q("SELECT COUNT(*) FROM orders WHERE status='cancelled'"),
-        "revenue":   q("SELECT COALESCE(SUM(amount),0) FROM orders WHERE status IN ('paid','done')"),
-        "avg_stars": q("SELECT AVG(stars) FROM feedbacks"),
-        "feedbacks": q("SELECT COUNT(*) FROM feedbacks"),
-    }
-
-    c.execute("""
-        SELECT DATE(created_at) AS date, SUM(amount) AS total
-        FROM orders
-        WHERE status IN ('paid', 'done')
-          AND created_at >= NOW() - INTERVAL '7 days'
-        GROUP BY DATE(created_at)
-        ORDER BY date
-    """)
-
-    revenue_rows = c.fetchall()
-
-    revenue_chart = [
-        [
-            row["date"].strftime("%d/%m") if row["date"] else "",
-            int(row["total"] or 0)
-        ]
-        for row in revenue_rows
-    ]
-
-    c.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT 10")
-    recent_orders = c.fetchall()
-
-    conn.close()
-    return render_template("dashboard.html",
-        stats=stats,
-        revenue_chart=revenue_chart,
-        recent_orders=list(recent_orders)
-    )
-
-
-# ── Helpers V2.1 ─────────────────────────────────────────────
-
-def _generate_order_code():
-    while True:
-        code = "LBS-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
-        if not db.order_exists(code):
-            return code
-
-
-def _generate_ticket_number():
-    return f"{random.randint(0, 9999):04d}"
-
-
-def _parse_int(value, default=0):
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return default
+import database as db
 
 
 
-def _send_order_to_discord(order):
-    """Gửi lại đơn vào #order bằng chính tài khoản bot Discord."""
-    bot_token = (
-        os.getenv("DISCORD_BOT_TOKEN")
-        or os.getenv("BOT_TOKEN")
-        or getattr(config, "DISCORD_BOT_TOKEN", "")
-        or getattr(config, "BOT_TOKEN", "")
-    ).strip()
-
-    channel_id = str(
-        os.getenv("ORDER_CHANNEL_ID")
-        or getattr(config, "ORDER_CHANNEL_ID", "")
-    ).strip()
-
-    if not bot_token:
-        raise RuntimeError(
-            "Chưa cấu hình DISCORD_BOT_TOKEN hoặc BOT_TOKEN"
-        )
-
-    if not channel_id:
-        raise RuntimeError(
-            "Chưa cấu hình ORDER_CHANNEL_ID"
-        )
-
-    status_map = {
-        "pending": "⏳ Đang chờ",
-        "processing": "🔄 Đang xử lý",
-        "paid": "💳 Đã thanh toán",
-        "done": "✅ Hoàn tất",
-        "cancelled": "❌ Đã hủy",
-    }
-
-    color_map = {
-        "pending": 0xF1C40F,
-        "processing": 0x3498DB,
-        "paid": 0x9B59B6,
-        "done": 0x2ECC71,
-        "cancelled": 0xE74C3C,
-    }
-
-    user_id = str(order["user_id"] or "").strip()
-    customer_value = (
-        f"<@{user_id}>"
-        if user_id and user_id != "0"
-        else (order["username"] or "Unknown")
-    )
-
-    ticket_channel = order["ticket_channel"]
-    ticket_number = order["ticket_number"]
-
-    if ticket_channel:
-        ticket_field_name = "📁 Ticket"
-        ticket_value = f"<#{ticket_channel}>"
-    else:
-        ticket_field_name = "📁 Ticket"
-        ticket_value = "*Không xác định*"
-
-    created_at = order["created_at"]
-    if created_at:
-        try:
-            time_text = created_at.strftime("%d/%m/%Y %H:%M")
-        except AttributeError:
-            time_text = str(created_at)
-    else:
-        time_text = datetime.now().strftime("%d/%m/%Y %H:%M")
-
-    status = order["status"] or "processing"
-
-    embed = {
-        "title": "📦 Đơn Hàng Mới",
-        "color": color_map.get(
-            status,
-            int(getattr(config, "COLOR_INFO", 0x3498DB))
-        ),
-        "fields": [
-            {
-                "name": "🧾 Mã đơn",
-                "value": f"`{order['order_code']}`",
-                "inline": True,
-            },
-            {
-                "name": "👤 Khách hàng",
-                "value": customer_value,
-                "inline": True,
-            },
-            {
-                "name": "🛍️ Sản phẩm",
-                "value": order["product_name"] or "Không rõ",
-                "inline": False,
-            },
-            {
-                "name": ticket_field_name,
-                "value": ticket_value,
-                "inline": True,
-            },
-            {
-                "name": "📌 Trạng thái",
-                "value": status_map.get(status, status),
-                "inline": True,
-            },
-            {
-                "name": "🕐 Thời gian",
-                "value": time_text,
-                "inline": True,
-            },
-        ],
-        "footer": {
-            "text": config.BOT_FOOTER
-        },
-    }
-
-    payload = json.dumps(
-        {
-            "embeds": [embed],
-            "allowed_mentions": {
-                "parse": []
-            },
-        }
-    ).encode("utf-8")
-
-    api_url = (
-        f"https://discord.com/api/v10/channels/"
-        f"{channel_id}/messages"
-    )
-
-    req = urllib.request.Request(
-        api_url,
-        data=payload,
-        headers={
-            "Authorization": f"Bot {bot_token}",
-            "Content-Type": "application/json",
-            "User-Agent": "LoveBotStore-Web/1.0",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            if response.status not in (200, 201):
-                raise RuntimeError(
-                    f"Discord API trả mã HTTP {response.status}"
-                )
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"Discord API lỗi HTTP {error.code}: {detail[:300]}"
-        ) from error
-    except urllib.error.URLError as error:
-        raise RuntimeError(
-            f"Không kết nối được Discord API: {error.reason}"
-        ) from error
-
-
-
-
-# ── Wallet helpers ───────────────────────────────────────────
-
-def _discord_bot_token():
+def has_ticket_manage_permission(member: discord.Member) -> bool:
+    role_ids = {role.id for role in member.roles}
     return (
-        os.getenv("DISCORD_BOT_TOKEN")
-        or os.getenv("BOT_TOKEN")
-        or getattr(config, "DISCORD_BOT_TOKEN", "")
-        or getattr(config, "BOT_TOKEN", "")
-    ).strip()
-
-
-def _send_discord_channel_embed(channel_id, embed):
-    """Gửi embed vào một kênh Discord bằng Bot REST API."""
-    token = _discord_bot_token()
-    if not token:
-        raise RuntimeError("Chưa cấu hình DISCORD_BOT_TOKEN hoặc BOT_TOKEN")
-
-    channel_id = int(channel_id or 0)
-    if not channel_id:
-        raise RuntimeError("Chưa cấu hình WALLET_LOG_CHANNEL_ID")
-
-    payload = json.dumps({
-        "embeds": [embed],
-        "allowed_mentions": {"parse": []},
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        f"https://discord.com/api/v10/channels/{channel_id}/messages",
-        data=payload,
-        headers={
-            "Authorization": f"Bot {token}",
-            "Content-Type": "application/json",
-            "User-Agent": "LoveBotStore-Web/1.0",
-        },
-        method="POST",
+        config.SUPPORT_ROLE_ID in role_ids
+        or config.ADMIN_ROLE_ID in role_ids
+        or config.FOUNDER_ROLE_ID in role_ids
+        or member.guild_permissions.administrator
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return response.status in (200, 201)
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"Không gửi được wallet log: HTTP {error.code} — {detail[:300]}"
-        ) from error
+
+def has_admin_ticket_permission(member: discord.Member) -> bool:
+    role_ids = {role.id for role in member.roles}
+    return (
+        config.ADMIN_ROLE_ID in role_ids
+        or config.FOUNDER_ROLE_ID in role_ids
+        or member.guild_permissions.administrator
+    )
 
 
-def _send_wallet_web_log(title, color, fields, description=None):
-    channel_id = (
+
+
+def is_founder(member: discord.Member) -> bool:
+    return (
+        any(role.id == config.FOUNDER_ROLE_ID for role in member.roles)
+        or member.guild_permissions.administrator
+    )
+
+
+def is_admin(member: discord.Member) -> bool:
+    return (
+        is_founder(member)
+        or any(role.id == config.ADMIN_ROLE_ID for role in member.roles)
+    )
+
+
+def is_support(member: discord.Member) -> bool:
+    return (
+        is_admin(member)
+        or any(role.id == config.SUPPORT_ROLE_ID for role in member.roles)
+    )
+
+
+def privileged_rank(member: discord.Member) -> int:
+    """0=member/buyer, 1=support, 2=admin, 3=founder."""
+    if is_founder(member):
+        return 3
+    if any(role.id == config.ADMIN_ROLE_ID for role in member.roles):
+        return 2
+    if any(role.id == config.SUPPORT_ROLE_ID for role in member.roles):
+        return 1
+    return 0
+
+
+def parse_money(text: str) -> int:
+    value = text.strip().lower().replace(" ", "").replace(",", ".")
+    if value.endswith("k"):
+        amount = int(float(value[:-1]) * 1_000)
+    elif value.endswith("m"):
+        amount = int(float(value[:-1]) * 1_000_000)
+    else:
+        amount = int(float(value.replace(".", "")))
+
+    if amount <= 0:
+        raise ValueError("Số tiền phải lớn hơn 0")
+    if amount > 1_000_000_000:
+        raise ValueError("Số tiền vượt quá giới hạn 1 tỷ")
+    return amount
+
+
+
+
+def get_store_bank_config():
+    """
+    Đọc tài khoản nhận tiền của Love Store từ config.py hoặc biến môi trường.
+
+    Tên khuyến nghị:
+      STORE_BANK_NAME
+      STORE_BANK_BIN
+      STORE_BANK_ACCOUNT_NUMBER
+      STORE_BANK_ACCOUNT_NAME
+    """
+    def pick(*names):
+        for name in names:
+            value = getattr(config, name, None) or os.getenv(name)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return ""
+
+    bank_name = pick(
+        "STORE_BANK_NAME",
+        "BANK_NAME",
+        "PAYMENT_BANK_NAME",
+    )
+    bank_bin = pick(
+        "STORE_BANK_BIN",
+        "BANK_BIN",
+        "PAYMENT_BANK_BIN",
+    )
+    account_number = pick(
+        "STORE_BANK_ACCOUNT_NUMBER",
+        "BANK_ACCOUNT_NUMBER",
+        "ACCOUNT_NUMBER",
+        "PAYMENT_ACCOUNT_NUMBER",
+    ).replace(" ", "")
+    account_name = pick(
+        "STORE_BANK_ACCOUNT_NAME",
+        "BANK_ACCOUNT_NAME",
+        "ACCOUNT_NAME",
+        "PAYMENT_ACCOUNT_NAME",
+    ).upper()
+
+    return {
+        "bank_name": bank_name,
+        "bank_bin": bank_bin,
+        "account_number": account_number,
+        "account_name": account_name,
+    }
+
+
+def money_fmt(amount: int) -> str:
+    return f"{int(amount):,}".replace(",", ".") + " VNĐ"
+
+
+async def send_wallet_log(
+    bot: commands.Bot,
+    *,
+    title: str,
+    color: int,
+    fields: list[tuple[str, str, bool]],
+    description: str | None = None,
+):
+    """Gửi embed log ví; lỗi log không làm hỏng giao dịch chính."""
+    channel_id = int(
         getattr(config, "WALLET_LOG_CHANNEL_ID", 0)
         or os.getenv("WALLET_LOG_CHANNEL_ID", "0")
+        or 0
     )
-    embed = {
-        "title": title,
-        "description": description,
-        "color": color,
-        "fields": fields,
-        "footer": {"text": getattr(config, "BOT_FOOTER", "Love Store")},
-        "timestamp": datetime.utcnow().isoformat(),
-    }
-    return _send_discord_channel_embed(channel_id, embed)
-
-
-def _send_discord_dm(discord_id, *, content=None, embed=None):
-    """Gửi DM Discord bằng nội dung chữ, embed hoặc cả hai."""
-    token = _discord_bot_token()
-    if not token:
-        raise RuntimeError("Chưa cấu hình DISCORD_BOT_TOKEN hoặc BOT_TOKEN")
-
-    headers = {
-        "Authorization": f"Bot {token}",
-        "Content-Type": "application/json",
-        "User-Agent": "LoveBotStore-Web/1.0",
-    }
-
-    create_payload = json.dumps({
-        "recipient_id": str(discord_id)
-    }).encode("utf-8")
-
-    create_req = urllib.request.Request(
-        "https://discord.com/api/v10/users/@me/channels",
-        data=create_payload,
-        headers=headers,
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(create_req, timeout=10) as response:
-            dm_channel = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"Không tạo được DM channel: HTTP {error.code} — {detail[:300]}"
-        ) from error
-
-    channel_id = dm_channel.get("id")
     if not channel_id:
-        raise RuntimeError("Discord không trả về ID kênh DM")
+        print("[Wallet Log] Chưa cấu hình WALLET_LOG_CHANNEL_ID")
+        return False
 
-    payload_data = {
-        "allowed_mentions": {"parse": []}
-    }
-    if content:
-        payload_data["content"] = str(content)
-    if embed:
-        payload_data["embeds"] = [embed]
+    try:
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            channel = await bot.fetch_channel(channel_id)
 
-    if not content and not embed:
-        raise ValueError("DM phải có content hoặc embed")
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            color=color,
+            timestamp=datetime.now(),
+        )
+        for field_name, field_value, inline in fields:
+            embed.add_field(
+                name=str(field_name)[:256],
+                value=str(field_value)[:1024] or "—",
+                inline=inline,
+            )
 
-    message_payload = json.dumps(payload_data).encode("utf-8")
+        embed.set_footer(text=getattr(config, "BOT_FOOTER", "Love Store"))
+        message = await channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return message
+    except Exception as error:
+        print(f"[Wallet Log] {type(error).__name__}: {error}")
+        return None
 
-    message_req = urllib.request.Request(
-        f"https://discord.com/api/v10/channels/{channel_id}/messages",
-        data=message_payload,
-        headers=headers,
-        method="POST",
+
+def ticket_number_from_channel(channel: discord.TextChannel) -> str:
+    name = channel.name
+    parts = name.rsplit("-", 1)
+    if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) == 4:
+        return parts[1]
+    return "—"
+
+
+BANK_BINS = {
+    "MB Bank": "970422",
+    "VPBank": "970432",
+    "Vietcombank": "970436",
+    "Techcombank": "970407",
+    "ACB": "970416",
+    "BIDV": "970418",
+    "VietinBank": "970415",
+    "Sacombank": "970403",
+    "TPBank": "970423",
+    "VIB": "970441",
+    "SHB": "970443",
+    "MSB": "970426",
+    "OCB": "970448",
+    "SeABank": "970440",
+    "Eximbank": "970431",
+    "HDBank": "970437",
+    "Agribank": "970405",
+    "Nam A Bank": "970428",
+    "PVcomBank": "970412",
+    "Bac A Bank": "970409",
+    "VietBank": "970433",
+    "BaoViet Bank": "970438",
+    "NCB": "970419",
+    "KienlongBank": "970452",
+    "ABBank": "970425",
+}
+
+
+class SlashCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @app_commands.command(
+        name="bxh",
+        description="🏆 Bảng xếp hạng người mua trong tháng"
     )
+    async def bxh(self, interaction: discord.Interaction):
+        now = datetime.now()
+        month = now.month
+        year = now.year
 
-    try:
-        with urllib.request.urlopen(message_req, timeout=10) as response:
-            return response.status in (200, 201)
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"Không gửi được DM: HTTP {error.code} — {detail[:300]}"
-        ) from error
+        conn = db.get_conn_dict()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                LOWER(TRIM(username)) AS buyer_key,
+                MIN(username) AS username,
+                COUNT(*) AS total_orders,
+                COALESCE(SUM(amount), 0) AS total_spent
+            FROM orders
+            WHERE status IN ('paid', 'done')
+              AND EXTRACT(MONTH FROM created_at) = %s
+              AND EXTRACT(YEAR FROM created_at) = %s
+              AND username IS NOT NULL
+              AND TRIM(username) <> ''
+            GROUP BY LOWER(TRIM(username))
+            ORDER BY total_spent DESC, total_orders DESC
+            LIMIT 10
+            """,
+            (month, year)
+        )
+        rows = cur.fetchall()
+        conn.close()
 
+        embed = discord.Embed(
+            title=f"🏆 BXH Người Mua Tháng {month}/{year}",
+            color=config.COLOR_PRIMARY,
+            timestamp=datetime.now()
+        )
 
-def _money(value):
-    return f"{int(value or 0):,}".replace(",", ".") + " VNĐ"
-
-
-# ── Đơn hàng ─────────────────────────────────────────────────
-
-@app.route("/orders")
-@login_required
-@role_required("founder", "admin")
-def orders():
-    status_filter = request.args.get("status", "all")
-    search        = request.args.get("search", "").strip()
-
-    conn   = db.get_conn_dict()
-    c      = conn.cursor()
-    query  = "SELECT * FROM orders WHERE 1=1"
-    params = []
-
-    if status_filter != "all":
-        query += " AND status=%s"
-        params.append(status_filter)
-    if search:
-        query += " AND (order_code ILIKE %s OR username ILIKE %s OR product_name ILIKE %s)"
-        params += [f"%{search}%", f"%{search}%", f"%{search}%"]
-
-    query += " ORDER BY created_at DESC"
-    c.execute(query, params)
-    rows = c.fetchall()
-    conn.close()
-    return render_template("orders.html", orders=list(rows), status_filter=status_filter, search=search)
-
-
-
-@app.route("/orders/create", methods=["GET", "POST"])
-@login_required
-@role_required("founder", "admin")
-def create_manual_order():
-    defaults = {
-        "order_code": _generate_order_code(),
-        "ticket_number": _generate_ticket_number(),
-        "status": "done",
-        "stars": 5,
-    }
-
-    if request.method == "POST":
-        order_code = request.form.get("order_code", "").strip().upper()
-        ticket_number = request.form.get("ticket_number", "").strip()
-        username = request.form.get("username", "").strip()
-        user_id = _parse_int(request.form.get("user_id"), 0)
-        product_name = request.form.get("product_name", "").strip()
-        amount = _parse_int(request.form.get("amount"), 0)
-        support_name = request.form.get("support_name", "").strip()
-        processor_name = request.form.get("processor_name", "").strip()
-        status = request.form.get("status", "done").strip()
-        feedback_content = request.form.get("feedback_content", "").strip()
-        stars = max(1, min(5, _parse_int(request.form.get("stars"), 5)))
-
-        defaults.update(request.form.to_dict())
-
-        if not order_code or not username or not product_name:
-            flash("❌ Mã đơn, người mua và sản phẩm không được để trống!", "error")
-        elif not ticket_number.isdigit() or len(ticket_number) != 4:
-            flash("❌ Mã ticket phải gồm đúng 4 chữ số!", "error")
-        elif amount < 0:
-            flash("❌ Số tiền không hợp lệ!", "error")
-        elif db.order_exists(order_code):
-            flash(f"❌ Mã đơn `{order_code}` đã tồn tại, không thể tạo trùng!", "error")
+        if not rows:
+            embed.description = "Chưa có đơn hàng nào trong tháng này!"
         else:
-            try:
-                db.create_manual_order(
-                    order_code, user_id, username, product_name, amount, status,
-                    ticket_number, support_name, processor_name
+            medals = ["🥇", "🥈", "🥉"]
+            lines = []
+
+            total_customers = len(rows)
+            leaderboard_revenue = sum(
+                int(row["total_spent"] or 0)
+                for row in rows
+            )
+            revenue_text = f"{leaderboard_revenue:,}".replace(",", ".")
+
+            lines.append(
+                f"👥 **{total_customers} khách hàng** • "
+                f"💰 **Tổng doanh thu BXH: {revenue_text} VNĐ**"
+            )
+            lines.append("")
+
+            for index, row in enumerate(rows):
+                rank = medals[index] if index < 3 else f"#{index + 1}"
+                name = row["username"]
+                order_count = int(row["total_orders"] or 0)
+                spent = f"{int(row['total_spent'] or 0):,}".replace(",", ".")
+
+                lines.append(
+                    f"{rank} **{name}** — "
+                    f"{order_count} đơn — {spent} VNĐ"
                 )
-                if feedback_content:
-                    db.upsert_manual_feedback(order_code, user_id, username, stars, feedback_content)
-                wdb.add_log(
-                    "Thêm đơn thủ công",
-                    f"{order_code} — {product_name} — {amount:,}đ",
-                    session.get("display", "Web")
+
+            embed.description = "\n".join(lines)
+
+        embed.set_footer(text=config.BOT_FOOTER)
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(
+        name="myorders",
+        description="📦 Xem thống kê đơn hàng của bạn"
+    )
+    async def myorders(self, interaction: discord.Interaction):
+        conn = db.get_conn_dict()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                COUNT(*) AS total_orders,
+                COALESCE(
+                    SUM(amount) FILTER (
+                        WHERE status IN ('paid', 'done')
+                    ),
+                    0
+                ) AS total_spent
+            FROM orders
+            WHERE user_id=%s
+            """,
+            (interaction.user.id,)
+        )
+        summary = cur.fetchone()
+        conn.close()
+
+        total_orders = int(summary["total_orders"] if summary else 0)
+        total_spent = summary["total_spent"] if summary else 0
+
+        embed = discord.Embed(
+            title=f"📦 Đơn hàng của {interaction.user.display_name}",
+            description=(
+                f"💵 **Tổng chi tiêu:** {money_fmt(total_spent)}\n"
+                f"📦 **Tổng số đơn hàng:** {total_orders}"
+            ),
+            color=config.COLOR_INFO,
+            timestamp=datetime.now()
+        )
+
+        if total_orders == 0:
+            embed.description = (
+                "Bạn chưa có đơn hàng nào!\n\n"
+                f"💵 **Tổng chi tiêu:** {money_fmt(0)}\n"
+                "📦 **Tổng số đơn hàng:** 0"
+            )
+
+        embed.set_footer(text=config.BOT_FOOTER)
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True
+        )
+
+    @app_commands.command(
+        name="checkticket",
+        description="🎫 Xem tất cả ticket đang mở và tự dọn ticket rác"
+    )
+    async def checkticket(self, interaction: discord.Interaction):
+        if not has_ticket_manage_permission(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Chỉ Support/Admin/Founder mới dùng được lệnh này!",
+                ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+
+        rows = db.get_all_open_tickets()
+        active = []
+        stale_count = 0
+
+        for row in rows:
+            channel = interaction.guild.get_channel(row["channel_id"])
+
+            if channel is None:
+                db.close_ticket(row["channel_id"])
+                stale_count += 1
+                continue
+
+            member = interaction.guild.get_member(row["user_id"])
+            status = row["status"] or "pending"
+
+            status_map = {
+                "pending": "⏳ Đang chờ",
+                "processing": "🔄 Đang xử lý",
+                "paid": "💳 Đã thanh toán",
+                "done": "✅ Hoàn tất — nên đóng",
+                "cancelled": "❌ Đã hủy — nên đóng",
+            }
+
+            active.append(
+                {
+                    "row": row,
+                    "channel": channel,
+                    "member": member,
+                    "status_text": status_map.get(status, status),
+                }
+            )
+
+        embed = discord.Embed(
+            title="🎫 Danh sách ticket đang mở",
+            color=config.COLOR_INFO,
+            timestamp=datetime.now()
+        )
+
+        if not active:
+            embed.description = "Hiện không còn ticket nào đang mở."
+            if stale_count:
+                embed.description += (
+                    f"\n\n🧹 Đã tự dọn **{stale_count} ticket rác**."
                 )
-                flash(f"✅ Đã tạo đơn `{order_code}`!", "success")
-                return redirect(url_for("order_detail", order_code=order_code))
-            except Exception as e:
-                flash(f"❌ Không thể tạo đơn: {e}", "error")
+        else:
+            embed.description = f"Đang có **{len(active)} ticket** còn hoạt động."
+            if stale_count:
+                embed.description += (
+                    f"\n🧹 Đã tự dọn **{stale_count} ticket rác**."
+                )
 
-    return render_template("create_order.html", defaults=defaults)
+            for item in active[:25]:
+                row = item["row"]
+                channel = item["channel"]
+                member = item["member"]
 
+                customer = (
+                    member.mention
+                    if member
+                    else f"`{row['user_id']}`"
+                )
 
-@app.route("/orders/my")
-@login_required
-def my_orders():
-    rows = wdb.get_orders_by_support(session["user_id"])
-    return render_template("my_orders.html", orders=rows)
+                ticket_number = (
+                    row["ticket_number"]
+                    or ticket_number_from_channel(channel)
+                )
 
+                # Ticket hỗ trợ không có đơn hàng và không cần hiển thị
+                # mã đơn/sản phẩm.
+                is_support_ticket = channel.name.startswith("support-")
 
-@app.route("/orders/<order_code>")
-@login_required
-@role_required("founder", "admin")
-def order_detail(order_code):
-    order = db.get_order(order_code)
-    if not order:
-        flash("❌ Không tìm thấy đơn hàng!", "error")
-        return redirect(url_for("orders"))
+                if is_support_ticket:
+                    field_value = (
+                        f"🎟️ Mã ticket: `{ticket_number}`\n"
+                        f"👤 Khách: {customer}\n"
+                        f"📍 Loại: **Hỗ trợ**\n"
+                        f"📌 Trạng thái: **⏳ Đang chờ hỗ trợ**\n"
+                        f"🔗 {channel.mention}"
+                    )
+                else:
+                    order_code = row["order_code"] or "Chưa có"
+                    product = row["product_name"] or "Chưa order"
 
-    feedback = db.get_feedback_by_order(order_code)
-    return render_template("order_detail.html", order=order, feedback=feedback)
+                    field_value = (
+                        f"🎟️ Mã ticket: `{ticket_number}`\n"
+                        f"👤 Khách: {customer}\n"
+                        f"📍 Loại: **Mua hàng**\n"
+                        f"🧾 Mã đơn: `{order_code}`\n"
+                        f"🛍️ Sản phẩm: `{product}`\n"
+                        f"📌 Trạng thái: **{item['status_text']}**\n"
+                        f"🔗 {channel.mention}"
+                    )
 
+                embed.add_field(
+                    name=f"#{channel.name}",
+                    value=field_value,
+                    inline=False
+                )
 
+            if len(active) > 25:
+                embed.set_footer(
+                    text=f"Chỉ hiển thị 25/{len(active)} ticket"
+                )
+            else:
+                embed.set_footer(text=config.BOT_FOOTER)
 
-@app.route("/orders/<order_code>/send-discord", methods=["POST"])
-@login_required
-@role_required("founder", "admin")
-def send_order_to_discord(order_code):
-    order = db.get_order(order_code)
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True
+        )
 
-    if not order:
-        flash("❌ Không tìm thấy đơn hàng!", "error")
-        return redirect(url_for("orders"))
+    @app_commands.command(
+        name="ticketinfo",
+        description="🔎 Xem chi tiết ticket theo mã 4 số"
+    )
+    @app_commands.describe(ticket_number="Mã ticket 4 số, ví dụ 3591")
+    async def ticketinfo(
+        self,
+        interaction: discord.Interaction,
+        ticket_number: str
+    ):
+        if not has_ticket_manage_permission(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Chỉ Support/Admin/Founder mới dùng được lệnh này!",
+                ephemeral=True
+            )
 
-    try:
-        _send_order_to_discord(order)
+        ticket_number = ticket_number.strip()
+
+        if not ticket_number.isdigit() or len(ticket_number) != 4:
+            return await interaction.response.send_message(
+                "❌ Mã ticket phải gồm đúng 4 chữ số!",
+                ephemeral=True
+            )
+
+        target_channel = None
+
+        for channel in interaction.guild.text_channels:
+            if channel.name.endswith(f"-{ticket_number}"):
+                target_channel = channel
+                break
+
+        if target_channel is None:
+            return await interaction.response.send_message(
+                f"❌ Không tìm thấy kênh ticket có mã `{ticket_number}`.",
+                ephemeral=True
+            )
+
+        ticket_row = db.get_ticket_by_channel(target_channel.id)
+        order = db.get_order_by_channel_any(target_channel.id)
+
+        if not ticket_row and not order:
+            return await interaction.response.send_message(
+                "⚠️ Kênh tồn tại nhưng không tìm thấy dữ liệu trong database.",
+                ephemeral=True
+            )
+
+        user_id = (
+            ticket_row["user_id"]
+            if ticket_row
+            else order["user_id"]
+        )
+        member = interaction.guild.get_member(user_id)
+
+        order_code = (
+            order["order_code"]
+            if order
+            else ticket_row["order_code"]
+        )
+        product = order["product_name"] if order else "Chưa order"
+        status = order["status"] if order else "pending"
+
+        status_map = {
+            "pending": "⏳ Đang chờ",
+            "processing": "🔄 Đang xử lý",
+            "paid": "💳 Đã thanh toán",
+            "done": "✅ Hoàn tất",
+            "cancelled": "❌ Đã hủy",
+        }
+
+        embed = discord.Embed(
+            title=f"🔎 Ticket #{ticket_number}",
+            color=config.COLOR_INFO,
+            timestamp=datetime.now()
+        )
+        embed.add_field(
+            name="📁 Kênh",
+            value=target_channel.mention,
+            inline=False
+        )
+        embed.add_field(
+            name="👤 Khách",
+            value=member.mention if member else f"`{user_id}`",
+            inline=True
+        )
+        embed.add_field(
+            name="🧾 Mã đơn",
+            value=f"`{order_code or 'Chưa có'}`",
+            inline=True
+        )
+        embed.add_field(
+            name="🛍️ Sản phẩm",
+            value=product,
+            inline=False
+        )
+        embed.add_field(
+            name="📌 Trạng thái",
+            value=status_map.get(status, status),
+            inline=True
+        )
+
+        if order:
+            embed.add_field(
+                name="🎧 Người nhận đơn",
+                value=order["support_name"] or "—",
+                inline=True
+            )
+            embed.add_field(
+                name="⚙️ Người xử lý",
+                value=order["processor_name"] or "—",
+                inline=True
+            )
+
+        embed.set_footer(text=config.BOT_FOOTER)
+
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True
+        )
+
+    @app_commands.command(
+        name="clearticket",
+        description="🧹 Xóa dữ liệu ticket bị kẹt của một thành viên"
+    )
+    @app_commands.describe(member="Người đang bị báo còn ticket")
+    async def clearticket(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member
+    ):
+        if not has_admin_ticket_permission(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Chỉ Admin/Founder mới dùng được lệnh này!",
+                ephemeral=True
+            )
+
+        deleted = db.clear_tickets_by_user(member.id)
+
+        await interaction.response.send_message(
+            (
+                f"✅ Đã xóa **{deleted} dữ liệu ticket** của "
+                f"{member.mention}.\n"
+                "Người đó có thể tạo ticket mới."
+            ),
+            ephemeral=True
+        )
+
+    @app_commands.command(
+        name="closeticket",
+        description="🔒 Đóng và xóa ticket theo mã 4 số"
+    )
+    @app_commands.describe(ticket_number="Mã ticket 4 số, ví dụ 3591")
+    async def closeticket(
+        self,
+        interaction: discord.Interaction,
+        ticket_number: str
+    ):
+        if not has_admin_ticket_permission(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Chỉ Admin/Founder mới dùng được lệnh này!",
+                ephemeral=True
+            )
+
+        ticket_number = ticket_number.strip()
+
+        if not ticket_number.isdigit() or len(ticket_number) != 4:
+            return await interaction.response.send_message(
+                "❌ Mã ticket phải gồm đúng 4 chữ số!",
+                ephemeral=True
+            )
+
+        target_channel = None
+
+        for channel in interaction.guild.text_channels:
+            if channel.name.endswith(f"-{ticket_number}"):
+                target_channel = channel
+                break
+
+        if target_channel is None:
+            return await interaction.response.send_message(
+                f"❌ Không tìm thấy ticket có mã `{ticket_number}`.",
+                ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+
+        db.close_ticket(target_channel.id)
+
+        channel_name = target_channel.name
+
+        await interaction.followup.send(
+            f"✅ Đang đóng `#{channel_name}`...",
+            ephemeral=True
+        )
 
         try:
-            wdb.add_log(
-                "Gửi lại đơn vào Discord",
-                f"{order_code} — {order['product_name']}",
-                session.get("display", "Web")
+            await target_channel.send(
+                f"🔒 Ticket được đóng từ xa bởi {interaction.user.mention}."
             )
-        except Exception as log_error:
-            print(
-                "[Web Order Resend] Không ghi được log: "
-                f"{type(log_error).__name__}: {log_error}"
-            )
+        except discord.HTTPException:
+            pass
 
-        flash(
-            f"✅ Đã gửi lại đơn `{order_code}` vào kênh #order!",
-            "success"
+        await target_channel.delete(
+            reason=f"Đóng từ xa bởi {interaction.user}"
         )
 
-    except Exception as error:
-        flash(
-            f"❌ Không gửi được đơn vào Discord: {error}",
-            "error"
-        )
-
-    return redirect(url_for("order_detail", order_code=order_code))
 
 
-@app.route("/orders/<order_code>/edit", methods=["GET", "POST"])
-@login_required
-@role_required("founder", "admin")
-def edit_order(order_code):
-    order = db.get_order(order_code)
-    if not order:
-        flash("❌ Không tìm thấy đơn hàng!", "error")
-        return redirect(url_for("orders"))
+    @app_commands.command(
+        name="addroleticket",
+        description="➕ Cho phép một role truy cập ticket hiện tại"
+    )
+    @app_commands.describe(
+        role="Role cần thêm quyền xem và nhắn trong ticket"
+    )
+    async def addroleticket(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role
+    ):
+        if not has_ticket_manage_permission(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Chỉ Support/Admin/Founder mới dùng được lệnh này!",
+                ephemeral=True
+            )
 
-    feedback = db.get_feedback_by_order(order_code)
+        channel = interaction.channel
 
-    if request.method == "POST":
-        new_code = request.form.get("order_code", "").strip().upper()
-        ticket_number = request.form.get("ticket_number", "").strip()
-        username = request.form.get("username", "").strip()
-        user_id = _parse_int(request.form.get("user_id"), 0)
-        product_name = request.form.get("product_name", "").strip()
-        amount = _parse_int(request.form.get("amount"), 0)
-        support_name = request.form.get("support_name", "").strip()
-        processor_name = request.form.get("processor_name", "").strip()
-        status = request.form.get("status", "pending").strip()
-        feedback_content = request.form.get("feedback_content", "").strip()
-        stars = max(1, min(5, _parse_int(request.form.get("stars"), 5)))
+        if not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message(
+                "❌ Lệnh này chỉ dùng được trong kênh ticket!",
+                ephemeral=True
+            )
 
-        if not new_code or not username or not product_name:
-            flash("❌ Mã đơn, người mua và sản phẩm không được để trống!", "error")
-        elif not ticket_number.isdigit() or len(ticket_number) != 4:
-            flash("❌ Mã ticket phải gồm đúng 4 chữ số!", "error")
-        elif amount < 0:
-            flash("❌ Số tiền không hợp lệ!", "error")
-        elif new_code != order_code and db.order_exists(new_code):
-            flash(f"❌ Mã đơn `{new_code}` đã tồn tại!", "error")
-        else:
+        # Chỉ cho dùng trong kênh có dữ liệu ticket/order.
+        try:
+            is_ticket = bool(
+                db.get_ticket_by_channel(channel.id)
+                or db.get_order_by_channel_any(channel.id)
+            )
+        except Exception:
+            is_ticket = False
+
+        if not is_ticket:
+            return await interaction.response.send_message(
+                "❌ Kênh này không phải ticket đang được hệ thống quản lý!",
+                ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            await channel.set_permissions(
+                role,
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True,
+                reason=f"Thêm role vào ticket bởi {interaction.user}"
+            )
+
+            await interaction.followup.send(
+                f"✅ Đã cho role {role.mention} truy cập {channel.mention}.",
+                ephemeral=True
+            )
+
             try:
-                db.update_order_full(
-                    order_code, new_code, user_id, username, product_name, amount,
-                    status, ticket_number, support_name, processor_name
+                await channel.send(
+                    f"➕ {interaction.user.mention} đã thêm {role.mention} vào ticket."
                 )
-                if feedback_content:
-                    db.upsert_manual_feedback(new_code, user_id, username, stars, feedback_content)
-                wdb.add_log(
-                    "Sửa đơn hàng",
-                    f"{order_code} -> {new_code}",
-                    session.get("display", "Web")
-                )
-                flash(f"✅ Đã cập nhật đơn `{new_code}`!", "success")
-                return redirect(url_for("order_detail", order_code=new_code))
-            except Exception as e:
-                flash(f"❌ Không thể cập nhật đơn: {e}", "error")
+            except discord.HTTPException:
+                pass
 
-    return render_template("edit_order.html", order=order, feedback=feedback)
-
-
-@app.route("/orders/<order_code>/update", methods=["POST"])
-@login_required
-@role_required("founder")
-def update_order(order_code):
-    status = request.form.get("status")
-    db.update_order_status(order_code, status)
-
-    status_map = {
-        "pending":    "⏳ Đang chờ",
-        "processing": "🔄 Đang xử lý",
-        "paid":       "💳 Đã thanh toán",
-        "done":       "✅ Hoàn tất",
-        "cancelled":  "❌ Đã hủy",
-    }
-    status_color = {
-        "pending":    0xF39C12,
-        "processing": 0x3498DB,
-        "paid":       0x9B59B6,
-        "done":       0x2ECC71,
-        "cancelled":  0xE74C3C,
-    }
-
-    import json
-    with open("pending_updates.json", "a") as f:
-        f.write(json.dumps({
-            "order_code":  order_code,
-            "status":      status,
-            "status_text": status_map.get(status, status),
-            "color":       status_color.get(status, 0x3498DB)
-        }) + "\n")
-
-    flash(f"✅ Đã cập nhật trạng thái đơn `{order_code}`!", "success")
-    return redirect(url_for("order_detail", order_code=order_code))
-
-
-@app.route("/orders/<order_code>/delete", methods=["POST"])
-@login_required
-@role_required("founder")
-def delete_order(order_code):
-    conn = db.get_conn()
-    c    = conn.cursor()
-    c.execute("DELETE FROM orders WHERE order_code=%s", (order_code,))
-    conn.commit()
-    conn.close()
-    flash(f"🗑️ Đã xóa đơn `{order_code}`!", "success")
-    return redirect(url_for("orders"))
-
-
-
-
-# ── Ví tiền ──────────────────────────────────────────────────
-
-@app.route("/wallets")
-@login_required
-@role_required("founder", "admin")
-def wallets():
-    status_filter = request.args.get("status", "pending").strip()
-    search = request.args.get("search", "").strip()
-
-    conn = db.get_conn_dict()
-    try:
-        c = conn.cursor()
-
-        query = """
-            SELECT
-                wt.*,
-                w.balance AS current_balance
-            FROM wallet_transactions wt
-            LEFT JOIN wallets w ON w.discord_id = wt.discord_id
-            WHERE wt.transaction_type='deposit_request'
-        """
-        params = []
-
-        if status_filter != "all":
-            query += " AND wt.status=%s"
-            params.append(status_filter)
-
-        if search:
-            query += """
-                AND (
-                    wt.transaction_code ILIKE %s
-                    OR wt.reference_code ILIKE %s
-                    OR wt.username ILIKE %s
-                    OR CAST(wt.discord_id AS TEXT) ILIKE %s
-                )
-            """
-            like = f"%{search}%"
-            params.extend([like, like, like, like])
-
-        query += " ORDER BY wt.created_at DESC"
-
-        c.execute(query, params)
-        requests = list(c.fetchall())
-
-        c.execute("""
-            SELECT
-                COUNT(*) FILTER (WHERE status='pending') AS pending,
-                COUNT(*) FILTER (WHERE status='completed') AS completed,
-                COUNT(*) FILTER (WHERE status='rejected') AS rejected,
-                COALESCE(SUM(amount) FILTER (WHERE status='completed'), 0) AS approved_amount
-            FROM wallet_transactions
-            WHERE transaction_type='deposit_request'
-        """)
-        stats = c.fetchone()
-
-        c.execute("""
-            SELECT *
-            FROM wallets
-            ORDER BY balance DESC, updated_at DESC
-            LIMIT 100
-        """)
-        wallet_rows = list(c.fetchall())
-
-    finally:
-        conn.close()
-
-    return render_template(
-        "wallets.html",
-        requests=requests,
-        wallets=wallet_rows,
-        stats=stats,
-        status_filter=status_filter,
-        search=search,
-    )
-
-
-@app.route("/wallets/<transaction_code>/approve", methods=["POST"])
-@login_required
-@role_required("founder")
-def approve_wallet_deposit(transaction_code):
-    conn = db.get_conn()
-    try:
-        c = conn.cursor()
-
-        # Khóa yêu cầu để không thể bấm duyệt hai lần.
-        c.execute(
-            """
-            SELECT id, discord_id, username, amount, reference_code, status
-            FROM wallet_transactions
-            WHERE transaction_code=%s
-              AND transaction_type='deposit_request'
-            FOR UPDATE
-            """,
-            (transaction_code,),
-        )
-        request_row = c.fetchone()
-
-        if not request_row:
-            conn.rollback()
-            flash("❌ Không tìm thấy yêu cầu nạp tiền!", "error")
-            return redirect(url_for("wallets"))
-
-        request_id, discord_id, username, amount, reference_code, status = request_row
-
-        if status != "pending":
-            conn.rollback()
-            flash(
-                f"⚠️ Yêu cầu `{transaction_code}` đã được xử lý trước đó.",
-                "error"
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ Bot thiếu quyền **Manage Channels / Quản lý kênh**!",
+                ephemeral=True
             )
-            return redirect(url_for("wallets"))
+        except Exception as error:
+            import traceback
+            traceback.print_exc()
+            await interaction.followup.send(
+                f"❌ Lỗi `/addroleticket`: `{type(error).__name__}: {error}`",
+                ephemeral=True
+            )
 
-        c.execute(
-            """
-            INSERT INTO wallets (discord_id, username)
-            VALUES (%s, %s)
-            ON CONFLICT (discord_id)
-            DO UPDATE SET
-                username=EXCLUDED.username,
-                updated_at=NOW()
-            """,
-            (discord_id, username or ""),
+    @app_commands.command(
+        name="addbank",
+        description="🏦 Lưu hoặc cập nhật thông tin ngân hàng của bạn"
+    )
+    @app_commands.describe(
+        bank_name="Chọn ngân hàng",
+        account_number="Số tài khoản",
+        account_name="Tên chủ tài khoản"
+    )
+    @app_commands.choices(
+        bank_name=[
+            app_commands.Choice(name="MB Bank", value="MB Bank"),
+            app_commands.Choice(name="VPBank", value="VPBank"),
+            app_commands.Choice(name="Vietcombank", value="Vietcombank"),
+            app_commands.Choice(name="Techcombank", value="Techcombank"),
+            app_commands.Choice(name="ACB", value="ACB"),
+            app_commands.Choice(name="BIDV", value="BIDV"),
+            app_commands.Choice(name="VietinBank", value="VietinBank"),
+            app_commands.Choice(name="Sacombank", value="Sacombank"),
+            app_commands.Choice(name="TPBank", value="TPBank"),
+            app_commands.Choice(name="VIB", value="VIB"),
+            app_commands.Choice(name="SHB", value="SHB"),
+            app_commands.Choice(name="MSB", value="MSB"),
+            app_commands.Choice(name="OCB", value="OCB"),
+            app_commands.Choice(name="SeABank", value="SeABank"),
+            app_commands.Choice(name="Eximbank", value="Eximbank"),
+            app_commands.Choice(name="HDBank", value="HDBank"),
+            app_commands.Choice(name="Agribank", value="Agribank"),
+            app_commands.Choice(name="Nam A Bank", value="Nam A Bank"),
+            app_commands.Choice(name="PVcomBank", value="PVcomBank"),
+            app_commands.Choice(name="Bac A Bank", value="Bac A Bank"),
+            app_commands.Choice(name="VietBank", value="VietBank"),
+            app_commands.Choice(name="BaoViet Bank", value="BaoViet Bank"),
+            app_commands.Choice(name="NCB", value="NCB"),
+            app_commands.Choice(name="KienlongBank", value="KienlongBank"),
+            app_commands.Choice(name="ABBank", value="ABBank"),
+        ]
+    )
+    async def addbank(
+        self,
+        interaction: discord.Interaction,
+        bank_name: app_commands.Choice[str],
+        account_number: str,
+        account_name: str
+    ):
+        if not has_ticket_manage_permission(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Chỉ Support/Admin/Founder mới được lưu thông tin ngân hàng!",
+                ephemeral=True
+            )
+
+        selected_bank = bank_name.value
+        account_number = account_number.replace(" ", "").strip()
+        account_name = account_name.strip().upper()
+        bank_bin = BANK_BINS.get(selected_bank)
+
+        if not account_number or not account_name:
+            return await interaction.response.send_message(
+                "❌ Vui lòng nhập đầy đủ số tài khoản và tên chủ tài khoản!",
+                ephemeral=True
+            )
+
+        if not account_number.isdigit():
+            return await interaction.response.send_message(
+                "❌ Số tài khoản chỉ được chứa chữ số!",
+                ephemeral=True
+            )
+
+        db.upsert_bank_account(
+            discord_id=interaction.user.id,
+            bank_name=selected_bank,
+            bank_bin=bank_bin,
+            account_number=account_number,
+            account_name=account_name,
         )
 
-        c.execute(
-            "SELECT balance FROM wallets WHERE discord_id=%s FOR UPDATE",
-            (discord_id,),
+        embed = discord.Embed(
+            title="✅ Đã lưu thông tin ngân hàng",
+            color=config.COLOR_SUCCESS,
+            timestamp=datetime.now()
         )
-        balance_before = int(c.fetchone()[0])
-        balance_after = balance_before + int(amount)
-
-        c.execute(
-            """
-            UPDATE wallets
-            SET balance=%s,
-                total_deposit=total_deposit + %s,
-                updated_at=NOW()
-            WHERE discord_id=%s
-            """,
-            (balance_after, amount, discord_id),
+        embed.add_field(
+            name="🏦 Ngân hàng",
+            value=selected_bank,
+            inline=True
         )
-
-        c.execute(
-            """
-            UPDATE wallet_transactions
-            SET status='completed',
-                performed_by=%s,
-                performer_name=%s,
-                balance_before=%s,
-                balance_after=%s,
-                reason=COALESCE(reason, '') || %s
-            WHERE id=%s
-            """,
-            (
-                int(session.get("user_id") or 0),
-                session.get("display", "Web"),
-                balance_before,
-                balance_after,
-                " | Duyệt và cộng ví trên web",
-                request_id,
-            ),
+        embed.add_field(
+            name="💳 Số tài khoản",
+            value=f"`{account_number}`",
+            inline=True
+        )
+        embed.add_field(
+            name="👤 Chủ tài khoản",
+            value=account_name,
+            inline=False
+        )
+        embed.add_field(
+            name="🔢 BIN tự động",
+            value=f"`{bank_bin}`",
+            inline=True
+        )
+        embed.set_footer(
+            text="Bot đã tự nhận BIN theo ngân hàng đã chọn."
         )
 
-        conn.commit()
-
-    except Exception as error:
-        conn.rollback()
-        flash(f"❌ Không thể duyệt yêu cầu: {error}", "error")
-        return redirect(url_for("wallets"))
-    finally:
-        conn.close()
-
-    dm_error = None
-    try:
-        _send_discord_dm(
-            discord_id,
-            embed={
-                "title": "✅ Nạp tiền thành công",
-                "description": (
-                    "Yêu cầu nạp tiền của bạn đã được Founder duyệt "
-                    "và cộng vào ví Love Store."
-                ),
-                "color": 0x2ECC71,
-                "fields": [
-                    {
-                        "name": "🧾 Mã giao dịch",
-                        "value": f"`{transaction_code}`",
-                        "inline": True,
-                    },
-                    {
-                        "name": "💰 Số tiền",
-                        "value": f"**{_money(amount)}**",
-                        "inline": True,
-                    },
-                    {
-                        "name": "💳 Số dư mới",
-                        "value": f"**{_money(balance_after)}**",
-                        "inline": False,
-                    },
-                    {
-                        "name": "📝 Nội dung chuyển khoản",
-                        "value": f"`{reference_code}`",
-                        "inline": False,
-                    },
-                ],
-                "footer": {
-                    "text": getattr(config, "BOT_FOOTER", "Love Store")
-                },
-                "timestamp": datetime.utcnow().isoformat(),
-            },
-        )
-    except Exception as error:
-        dm_error = str(error)
-
-    try:
-        _send_wallet_web_log(
-            "🟢 Đã duyệt nạp tiền",
-            0x2ECC71,
-            [
-                {"name": "👤 Khách hàng", "value": f"{username or 'Không rõ'}\n`{discord_id}`", "inline": False},
-                {"name": "👑 Người duyệt", "value": session.get("display", "Web"), "inline": False},
-                {"name": "➕ Số tiền", "value": f"**{_money(amount)}**", "inline": True},
-                {"name": "💳 Biến động số dư", "value": f"{_money(balance_before)} → **{_money(balance_after)}**", "inline": False},
-                {"name": "🧾 Mã giao dịch", "value": f"`{transaction_code}`", "inline": True},
-                {"name": "📝 Nội dung CK", "value": f"`{reference_code}`", "inline": False},
-            ],
-        )
-    except Exception as log_error:
-        print(f"[Wallet Discord Log] {log_error}")
-
-    try:
-        wdb.add_log(
-            "Duyệt nạp ví",
-            f"{transaction_code} — {username} — {_money(amount)}",
-            session.get("display", "Web"),
-        )
-    except Exception as log_error:
-        print(f"[Wallet Log] {log_error}")
-
-    if dm_error:
-        flash(
-            f"✅ Đã cộng {_money(amount)} vào ví, nhưng không DM được khách: {dm_error}",
-            "success"
-        )
-    else:
-        flash(
-            f"✅ Đã duyệt `{transaction_code}`, cộng {_money(amount)} và DM khách!",
-            "success"
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True
         )
 
-    return redirect(url_for("wallets"))
+    @app_commands.command(
+        name="infobank",
+        description="🏦 Xem thông tin ngân hàng đã lưu"
+    )
+    @app_commands.describe(
+        member="Xem thông tin của nhân viên khác (chỉ Admin/Founder)"
+    )
+    async def infobank(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member = None
+    ):
+        target = member or interaction.user
 
-
-@app.route("/wallets/<transaction_code>/mark-completed", methods=["POST"])
-@login_required
-@role_required("founder")
-def mark_wallet_deposit_completed(transaction_code):
-    """Đánh dấu đã xử lý khi tiền đã được cộng thủ công bằng /congtien."""
-    conn = db.get_conn()
-    try:
-        c = conn.cursor()
-        c.execute(
-            """
-            SELECT id, discord_id, username, amount, reference_code, status
-            FROM wallet_transactions
-            WHERE transaction_code=%s
-              AND transaction_type='deposit_request'
-            FOR UPDATE
-            """,
-            (transaction_code,),
-        )
-        row = c.fetchone()
-
-        if not row:
-            conn.rollback()
-            flash("❌ Không tìm thấy yêu cầu nạp tiền!", "error")
-            return redirect(url_for("wallets"))
-
-        request_id, discord_id, username, amount, reference_code, status = row
-
-        if status != "pending":
-            conn.rollback()
-            flash("⚠️ Yêu cầu này đã được xử lý trước đó.", "error")
-            return redirect(url_for("wallets"))
-
-        c.execute(
-            "SELECT balance FROM wallets WHERE discord_id=%s",
-            (discord_id,),
-        )
-        wallet_row = c.fetchone()
-        current_balance = int(wallet_row[0]) if wallet_row else 0
-
-        c.execute(
-            """
-            UPDATE wallet_transactions
-            SET status='completed',
-                performed_by=%s,
-                performer_name=%s,
-                balance_before=%s,
-                balance_after=%s,
-                reason=COALESCE(reason, '') || %s
-            WHERE id=%s
-            """,
-            (
-                int(session.get("user_id") or 0),
-                session.get("display", "Web"),
-                current_balance,
-                current_balance,
-                " | Đã cộng thủ công, web chỉ xác nhận",
-                request_id,
-            ),
-        )
-        conn.commit()
-
-    except Exception as error:
-        conn.rollback()
-        flash(f"❌ Không thể xác nhận yêu cầu: {error}", "error")
-        return redirect(url_for("wallets"))
-    finally:
-        conn.close()
-
-    dm_error = None
-    try:
-        _send_discord_dm(
-            discord_id,
-            embed={
-                "title": "✅ Đã xác nhận nạp tiền",
-                "description": (
-                    "Founder đã xác nhận tiền được cộng thủ công "
-                    "vào ví Love Store của bạn."
-                ),
-                "color": 0x3498DB,
-                "fields": [
-                    {
-                        "name": "🧾 Mã giao dịch",
-                        "value": f"`{transaction_code}`",
-                        "inline": True,
-                    },
-                    {
-                        "name": "💰 Số tiền",
-                        "value": f"**{_money(amount)}**",
-                        "inline": True,
-                    },
-                    {
-                        "name": "💳 Số dư hiện tại",
-                        "value": f"**{_money(current_balance)}**",
-                        "inline": False,
-                    },
-                ],
-                "footer": {
-                    "text": getattr(config, "BOT_FOOTER", "Love Store")
-                },
-                "timestamp": datetime.utcnow().isoformat(),
-            },
-        )
-    except Exception as error:
-        dm_error = str(error)
-
-    try:
-        _send_wallet_web_log(
-            "🔵 Xác nhận đã cộng tiền thủ công",
-            0x3498DB,
-            [
-                {"name": "👤 Khách hàng", "value": f"{username or 'Không rõ'}\n`{discord_id}`", "inline": False},
-                {"name": "👑 Người xác nhận", "value": session.get("display", "Web"), "inline": False},
-                {"name": "💰 Số tiền yêu cầu", "value": f"**{_money(amount)}**", "inline": True},
-                {"name": "💳 Số dư hiện tại", "value": f"**{_money(current_balance)}**", "inline": True},
-                {"name": "🧾 Mã giao dịch", "value": f"`{transaction_code}`", "inline": False},
-            ],
-        )
-    except Exception as log_error:
-        print(f"[Wallet Discord Log] {log_error}")
-
-    if dm_error:
-        flash(
-            f"✅ Đã đánh dấu hoàn tất, nhưng không DM được khách: {dm_error}",
-            "success"
-        )
-    else:
-        flash("✅ Đã đánh dấu hoàn tất và DM khách!", "success")
-
-    return redirect(url_for("wallets"))
-
-
-@app.route("/wallets/<transaction_code>/reject", methods=["POST"])
-@login_required
-@role_required("founder")
-def reject_wallet_deposit(transaction_code):
-    reject_reason = request.form.get("reason", "").strip() or "Không xác nhận được giao dịch"
-
-    conn = db.get_conn()
-    try:
-        c = conn.cursor()
-        c.execute(
-            """
-            SELECT id, discord_id, amount, reference_code, status
-            FROM wallet_transactions
-            WHERE transaction_code=%s
-              AND transaction_type='deposit_request'
-            FOR UPDATE
-            """,
-            (transaction_code,),
-        )
-        row = c.fetchone()
-
-        if not row:
-            conn.rollback()
-            flash("❌ Không tìm thấy yêu cầu nạp tiền!", "error")
-            return redirect(url_for("wallets"))
-
-        request_id, discord_id, amount, reference_code, status = row
-
-        if status != "pending":
-            conn.rollback()
-            flash("⚠️ Yêu cầu này đã được xử lý trước đó.", "error")
-            return redirect(url_for("wallets"))
-
-        c.execute(
-            """
-            UPDATE wallet_transactions
-            SET status='rejected',
-                performed_by=%s,
-                performer_name=%s,
-                reason=%s
-            WHERE id=%s
-            """,
-            (
-                int(session.get("user_id") or 0),
-                session.get("display", "Web"),
-                reject_reason[:500],
-                request_id,
-            ),
-        )
-        conn.commit()
-
-    except Exception as error:
-        conn.rollback()
-        flash(f"❌ Không thể từ chối yêu cầu: {error}", "error")
-        return redirect(url_for("wallets"))
-    finally:
-        conn.close()
-
-    dm_error = None
-    try:
-        _send_discord_dm(
-            discord_id,
-            embed={
-                "title": "❌ Yêu cầu nạp tiền bị từ chối",
-                "description": (
-                    "Yêu cầu của bạn chưa được xác nhận. "
-                    "Hãy liên hệ Support nếu bạn đã chuyển khoản."
-                ),
-                "color": 0xE74C3C,
-                "fields": [
-                    {
-                        "name": "🧾 Mã giao dịch",
-                        "value": f"`{transaction_code}`",
-                        "inline": True,
-                    },
-                    {
-                        "name": "💰 Số tiền",
-                        "value": f"**{_money(amount)}**",
-                        "inline": True,
-                    },
-                    {
-                        "name": "📝 Nội dung chuyển khoản",
-                        "value": f"`{reference_code}`",
-                        "inline": False,
-                    },
-                    {
-                        "name": "📌 Lý do",
-                        "value": reject_reason[:1024],
-                        "inline": False,
-                    },
-                ],
-                "footer": {
-                    "text": getattr(config, "BOT_FOOTER", "Love Store")
-                },
-                "timestamp": datetime.utcnow().isoformat(),
-            },
-        )
-    except Exception as error:
-        dm_error = str(error)
-
-    try:
-        _send_wallet_web_log(
-            "🔴 Từ chối yêu cầu nạp tiền",
-            0xE74C3C,
-            [
-                {"name": "👤 Khách hàng", "value": f"`{discord_id}`", "inline": False},
-                {"name": "👑 Người từ chối", "value": session.get("display", "Web"), "inline": False},
-                {"name": "💰 Số tiền", "value": f"**{_money(amount)}**", "inline": True},
-                {"name": "🧾 Mã giao dịch", "value": f"`{transaction_code}`", "inline": True},
-                {"name": "📝 Nội dung CK", "value": f"`{reference_code}`", "inline": False},
-                {"name": "📌 Lý do", "value": reject_reason[:1024], "inline": False},
-            ],
-        )
-    except Exception as log_error:
-        print(f"[Wallet Discord Log] {log_error}")
-
-    if dm_error:
-        flash(
-            f"✅ Đã từ chối yêu cầu, nhưng không DM được khách: {dm_error}",
-            "success"
-        )
-    else:
-        flash("✅ Đã từ chối yêu cầu và DM khách!", "success")
-
-    return redirect(url_for("wallets"))
-
-
-# ── Khách hàng ────────────────────────────────────────────────
-
-@app.route("/customers")
-@login_required
-@role_required("founder", "admin")
-def customers():
-    conn = db.get_conn_dict()
-    c    = conn.cursor()
-    c.execute("""
-        SELECT user_id, username,
-               COUNT(*) as total_orders,
-               SUM(CASE WHEN status IN ('paid','done') THEN amount ELSE 0 END) as total_spent,
-               MAX(created_at) as last_order
-        FROM orders GROUP BY user_id, username ORDER BY total_spent DESC NULLS LAST
-    """)
-    rows = c.fetchall()
-    conn.close()
-    return render_template("customers.html", customers=list(rows))
-
-
-@app.route("/customers/<int:user_id>")
-@login_required
-@role_required("founder", "admin")
-def customer_detail(user_id):
-    conn = db.get_conn_dict()
-    c    = conn.cursor()
-    c.execute("SELECT * FROM orders WHERE user_id=%s ORDER BY created_at DESC", (user_id,))
-    rows = c.fetchall()
-    conn.close()
-    return render_template("customer_detail.html", orders=list(rows), user_id=user_id)
-
-
-# ── Feedback ──────────────────────────────────────────────────
-
-@app.route("/feedbacks")
-@login_required
-@role_required("founder", "admin")
-def feedbacks():
-    conn = db.get_conn_dict()
-    c    = conn.cursor()
-    c.execute("SELECT * FROM feedbacks ORDER BY created_at DESC")
-    rows = c.fetchall()
-    conn.close()
-    return render_template("feedbacks.html", feedbacks=list(rows))
-
-
-
-@app.route("/feedbacks/edit-discord", methods=["GET", "POST"])
-@login_required
-@role_required("founder")
-def edit_discord_feedback():
-    result = None
-
-    if request.method == "POST":
-        message_url = request.form.get("message_url", "").strip()
-        new_order_code = request.form.get("order_code", "").strip().upper()
-        new_product_name = request.form.get("product_name", "").strip()
-
-        if not message_url or not new_order_code or not new_product_name:
-            flash("❌ Vui lòng nhập đủ link tin nhắn, mã đơn và sản phẩm!", "error")
-        else:
-            try:
-                from webhook_server import edit_feedback_message_sync
-                result = edit_feedback_message_sync(
-                    message_url,
-                    new_order_code,
-                    new_product_name
+        if target.id != interaction.user.id:
+            if not has_admin_ticket_permission(interaction.user):
+                return await interaction.response.send_message(
+                    "❌ Chỉ Admin/Founder mới được xem thông tin ngân hàng của người khác!",
+                    ephemeral=True
                 )
 
-                if result.get("success"):
-                    wdb.add_log(
-                        "Sửa feedback Discord",
-                        f"{new_order_code} — {new_product_name}",
-                        session.get("display", "Web")
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            bank = db.get_bank_account(target.id)
+
+            if not bank:
+                message = (
+                    f"❌ {target.mention} chưa lưu thông tin ngân hàng."
+                    if target.id != interaction.user.id
+                    else "❌ Bạn chưa lưu thông tin ngân hàng. Dùng `/addbank` trước nhé!"
+                )
+                return await interaction.followup.send(
+                    message,
+                    ephemeral=True
+                )
+
+            account_name = str(bank.get("account_name") or "")
+            account_number = str(bank.get("account_number") or "")
+            bank_bin = str(bank.get("bank_bin") or "")
+            encoded_name = urllib.parse.quote(account_name)
+
+            embed = discord.Embed(
+                title=f"🏦 Thông tin ngân hàng — {target.display_name}",
+                color=config.COLOR_INFO,
+                timestamp=datetime.now()
+            )
+            embed.add_field(
+                name="🏦 Ngân hàng",
+                value=bank.get("bank_name") or "Không rõ",
+                inline=True
+            )
+            embed.add_field(
+                name="💳 Số tài khoản",
+                value=f"`{account_number}`",
+                inline=True
+            )
+            embed.add_field(
+                name="👤 Chủ tài khoản",
+                value=account_name or "Không rõ",
+                inline=False
+            )
+
+            if bank_bin and account_number:
+                qr_url = (
+                    "https://img.vietqr.io/image/"
+                    f"{bank_bin}-{account_number}-compact2.png"
+                    f"?accountName={encoded_name}"
+                )
+                embed.add_field(
+                    name="🔢 BIN",
+                    value=f"`{bank_bin}`",
+                    inline=True
+                )
+                embed.set_image(url=qr_url)
+            else:
+                embed.add_field(
+                    name="ℹ️ QR",
+                    value="Chưa đủ BIN hoặc số tài khoản để tạo QR.",
+                    inline=False
+                )
+
+            embed.set_footer(text=config.BOT_FOOTER)
+
+            await interaction.followup.send(
+                embed=embed,
+                ephemeral=True
+            )
+
+        except Exception as error:
+            import traceback
+            traceback.print_exc()
+            await interaction.followup.send(
+                f"❌ Lỗi `/infobank`: `{type(error).__name__}: {error}`",
+                ephemeral=True
+            )
+
+    @app_commands.command(
+        name="qr",
+        description="💳 Tạo mã QR thanh toán ở bất kỳ kênh nào"
+    )
+    @app_commands.describe(
+        amount="Số tiền, ví dụ 20k, 50k, 1m hoặc 50000",
+        content="Nội dung chuyển khoản",
+        member="Dùng tài khoản ngân hàng của người khác (Admin/Founder)"
+    )
+    async def qr(
+        self,
+        interaction: discord.Interaction,
+        amount: str,
+        content: str = "LOVE STORE",
+        member: discord.Member = None
+    ):
+        target = member or interaction.user
+
+        if target.id != interaction.user.id:
+            if not has_admin_ticket_permission(interaction.user):
+                return await interaction.response.send_message(
+                    "❌ Chỉ Admin/Founder mới được tạo QR từ ngân hàng của người khác!",
+                    ephemeral=True
+                )
+
+        await interaction.response.defer()
+
+        try:
+            amount_text = amount.strip().lower().replace(",", ".")
+
+            if amount_text.endswith("k"):
+                amount_value = int(float(amount_text[:-1]) * 1_000)
+            elif amount_text.endswith("m"):
+                amount_value = int(float(amount_text[:-1]) * 1_000_000)
+            else:
+                amount_value = int(float(amount_text))
+
+            if amount_value <= 0:
+                return await interaction.followup.send(
+                    "❌ Số tiền phải lớn hơn 0!",
+                    ephemeral=True
+                )
+
+            bank = db.get_bank_account(target.id)
+
+            if not bank:
+                return await interaction.followup.send(
+                    (
+                        f"❌ {target.mention} chưa lưu thông tin ngân hàng bằng `/addbank`."
+                        if target.id != interaction.user.id
+                        else "❌ Bạn chưa lưu thông tin ngân hàng. Dùng `/addbank` trước nhé!"
+                    ),
+                    ephemeral=True
+                )
+
+            bank_name = str(bank.get("bank_name") or "Không rõ")
+            bank_bin = str(bank.get("bank_bin") or "")
+            account_number = str(bank.get("account_number") or "")
+            account_name = str(bank.get("account_name") or "")
+            transfer_content = content.strip()[:50] or "LOVE STORE"
+
+            if not bank_bin or not account_number:
+                return await interaction.followup.send(
+                    "❌ Tài khoản ngân hàng này chưa đủ BIN hoặc số tài khoản để tạo QR!",
+                    ephemeral=True
+                )
+
+            qr_url = (
+                "https://img.vietqr.io/image/"
+                f"{bank_bin}-{account_number}-compact2.png"
+                f"?amount={amount_value}"
+                f"&addInfo={urllib.parse.quote(transfer_content)}"
+                f"&accountName={urllib.parse.quote(account_name)}"
+            )
+
+            amount_fmt = f"{amount_value:,}".replace(",", ".")
+
+            embed = discord.Embed(
+                title="💳 Mã QR Thanh Toán",
+                description="Quét mã QR bên dưới để thanh toán nhanh.",
+                color=config.COLOR_PRIMARY,
+                timestamp=datetime.now()
+            )
+            embed.add_field(
+                name="🏦 Ngân hàng",
+                value=bank_name,
+                inline=True
+            )
+            embed.add_field(
+                name="💳 Số tài khoản",
+                value=f"`{account_number}`",
+                inline=True
+            )
+            embed.add_field(
+                name="👤 Chủ tài khoản",
+                value=account_name,
+                inline=False
+            )
+            embed.add_field(
+                name="💰 Số tiền",
+                value=f"**{amount_fmt} VNĐ**",
+                inline=True
+            )
+            embed.add_field(
+                name="📝 Nội dung CK",
+                value=f"`{transfer_content}`",
+                inline=True
+            )
+            embed.set_image(url=qr_url)
+            embed.set_footer(
+                text=f"Tạo bởi {interaction.user.display_name} • {config.BOT_FOOTER}"
+            )
+
+            await interaction.followup.send(embed=embed)
+
+        except ValueError:
+            await interaction.followup.send(
+                "❌ Số tiền không hợp lệ! Ví dụ: `20k`, `1m`, `50000`.",
+                ephemeral=True
+            )
+        except Exception as error:
+            import traceback
+            traceback.print_exc()
+            await interaction.followup.send(
+                f"❌ Lỗi `/qr`: `{type(error).__name__}: {error}`",
+                ephemeral=True
+            )
+
+
+    @app_commands.command(
+        name="vitien",
+        description="💰 Kiểm tra số dư ví Love Store"
+    )
+    async def vitien(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            wallet = db.get_wallet(
+                interaction.user.id,
+                interaction.user.display_name,
+            )
+
+            embed = discord.Embed(
+                title=f"💰 Ví Love Store — {interaction.user.display_name}",
+                color=config.COLOR_INFO,
+                timestamp=datetime.now()
+            )
+            embed.add_field(
+                name="💵 Số dư hiện tại",
+                value=f"**{money_fmt(wallet['balance'])}**",
+                inline=False
+            )
+            embed.add_field(
+                name="📥 Tổng đã nạp",
+                value=money_fmt(wallet["total_deposit"]),
+                inline=True
+            )
+            embed.set_footer(text=config.BOT_FOOTER)
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as error:
+            await interaction.followup.send(
+                f"❌ Không thể tải ví: `{type(error).__name__}: {error}`",
+                ephemeral=True
+            )
+
+    @app_commands.command(
+        name="naptienvaovi",
+        description="📥 Tạo yêu cầu nạp tiền vào ví Love Store"
+    )
+    @app_commands.describe(
+        amount="Số tiền muốn nạp, ví dụ 20k, 50k hoặc 100000"
+    )
+    async def naptienvaovi(
+        self,
+        interaction: discord.Interaction,
+        amount: str
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            amount_value = parse_money(amount)
+            short_amount = (
+                f"{amount_value // 1_000}K"
+                if amount_value % 1_000 == 0 and amount_value < 1_000_000
+                else str(amount_value)
+            )
+            random_code = secrets.randbelow(9000) + 1000
+            reference_code = f"NAPTIEN{short_amount}-{random_code}"
+
+            bank = get_store_bank_config()
+
+            missing = [
+                key for key in (
+                    "bank_name",
+                    "bank_bin",
+                    "account_number",
+                    "account_name",
+                )
+                if not bank[key]
+            ]
+            if missing:
+                return await interaction.followup.send(
+                    (
+                        "❌ Chưa cấu hình đủ tài khoản nhận tiền của Love Store.\n"
+                        "Cần các biến: `STORE_BANK_NAME`, `STORE_BANK_BIN`, "
+                        "`STORE_BANK_ACCOUNT_NUMBER`, `STORE_BANK_ACCOUNT_NAME`."
+                    ),
+                    ephemeral=True
+                )
+
+            request = db.create_deposit_request(
+                discord_id=interaction.user.id,
+                username=interaction.user.display_name,
+                amount=amount_value,
+                reference_code=reference_code,
+            )
+
+            qr_url = (
+                "https://img.vietqr.io/image/"
+                f"{bank['bank_bin']}-{bank['account_number']}-compact2.png"
+                f"?amount={amount_value}"
+                f"&addInfo={urllib.parse.quote(reference_code)}"
+                f"&accountName={urllib.parse.quote(bank['account_name'])}"
+            )
+
+            embed = discord.Embed(
+                title="📥 Nạp tiền vào ví Love Store",
+                description=(
+                    "Quét QR và chuyển đúng số tiền. "
+                    "Không sửa nội dung chuyển khoản để Founder dễ xác nhận."
+                ),
+                color=config.COLOR_PRIMARY,
+                timestamp=datetime.now()
+            )
+            embed.add_field(
+                name="🏦 Ngân hàng",
+                value=bank["bank_name"],
+                inline=True
+            )
+            embed.add_field(
+                name="💳 Số tài khoản",
+                value=f"`{bank['account_number']}`",
+                inline=True
+            )
+            embed.add_field(
+                name="👤 Chủ tài khoản",
+                value=bank["account_name"],
+                inline=False
+            )
+            embed.add_field(
+                name="💰 Số tiền",
+                value=f"**{money_fmt(amount_value)}**",
+                inline=True
+            )
+            embed.add_field(
+                name="📝 Nội dung chuyển khoản",
+                value=f"`{reference_code}`",
+                inline=False
+            )
+            embed.add_field(
+                name="🧾 Mã yêu cầu",
+                value=f"`{request['transaction_code']}`",
+                inline=True
+            )
+            embed.add_field(
+                name="📌 Trạng thái",
+                value="⏳ Đang chờ Founder duyệt",
+                inline=True
+            )
+            embed.set_image(url=qr_url)
+            embed.set_footer(text=config.BOT_FOOTER)
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+            log_message = await send_wallet_log(
+                self.bot,
+                title="🟡 Yêu cầu nạp tiền mới",
+                color=0xF1C40F,
+                fields=[
+                    ("👤 Người yêu cầu", f"{interaction.user.mention}\n`{interaction.user.id}`", False),
+                    ("💰 Số tiền", f"**{money_fmt(amount_value)}**", True),
+                    ("🧾 Mã yêu cầu", f"`{request['transaction_code']}`", True),
+                    ("📝 Nội dung chuyển khoản", f"`{reference_code}`", False),
+                    ("📌 Trạng thái", "⏳ Đang chờ Founder duyệt", False),
+                ],
+            )
+
+            if log_message:
+                try:
+                    await asyncio.to_thread(
+                        db.save_wallet_log_message,
+                        request["transaction_code"],
+                        log_message.channel.id,
+                        log_message.id,
                     )
-                    flash("✅ Đã sửa mã đơn và sản phẩm trên feedback Discord!", "success")
-                else:
-                    flash(
-                        f"❌ {result.get('message', 'Không sửa được tin nhắn')}",
-                        "error"
+                except Exception as save_error:
+                    print(
+                        "[Wallet Log Save] "
+                        f"{type(save_error).__name__}: {save_error}"
                     )
-            except Exception as e:
-                flash(f"❌ Lỗi sửa feedback Discord: {e}", "error")
+        except ValueError as error:
+            await interaction.followup.send(
+                f"❌ Số tiền không hợp lệ: {error}",
+                ephemeral=True
+            )
+        except Exception as error:
+            await interaction.followup.send(
+                f"❌ Không thể tạo yêu cầu nạp: `{type(error).__name__}: {error}`",
+                ephemeral=True
+            )
 
-    return render_template("edit_discord_feedback.html", result=result)
+    @app_commands.command(
+        name="congtien",
+        description="➕ Cộng tiền thủ công vào ví (Founder only)"
+    )
+    @app_commands.describe(
+        member="Người được cộng tiền",
+        amount="Số tiền, ví dụ 20k, 50k hoặc 100000",
+        reason="Lý do cộng tiền"
+    )
+    async def congtien(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        amount: str,
+        reason: str
+    ):
+        if not is_founder(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Chỉ Founder mới được dùng `/congtien`!",
+                ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            amount_value = parse_money(amount)
+            result = db.add_wallet_money(
+                discord_id=member.id,
+                username=member.display_name,
+                amount=amount_value,
+                reason=reason.strip()[:250],
+                performed_by=interaction.user.id,
+                performer_name=interaction.user.display_name,
+            )
+
+            embed = discord.Embed(
+                title="✅ Đã cộng tiền vào ví",
+                color=config.COLOR_SUCCESS,
+                timestamp=datetime.now()
+            )
+            embed.add_field(name="👤 Thành viên", value=member.mention, inline=False)
+            embed.add_field(name="➕ Số tiền", value=money_fmt(amount_value), inline=True)
+            embed.add_field(
+                name="💰 Số dư",
+                value=(
+                    f"{money_fmt(result['balance_before'])} → "
+                    f"**{money_fmt(result['balance_after'])}**"
+                ),
+                inline=False
+            )
+            embed.add_field(name="📝 Lý do", value=reason[:1024], inline=False)
+            embed.add_field(
+                name="🧾 Mã giao dịch",
+                value=f"`{result['transaction_code']}`",
+                inline=True
+            )
+            embed.set_footer(text=f"Thực hiện bởi {interaction.user}")
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+            await send_wallet_log(
+                self.bot,
+                title="🟢 Founder cộng tiền vào ví",
+                color=0x2ECC71,
+                fields=[
+                    ("👑 Người thực hiện", f"{interaction.user.mention}\n`{interaction.user.id}`", False),
+                    ("👤 Người nhận", f"{member.mention}\n`{member.id}`", False),
+                    ("➕ Số tiền", f"**{money_fmt(amount_value)}**", True),
+                    (
+                        "💳 Biến động số dư",
+                        f"{money_fmt(result['balance_before'])} → "
+                        f"**{money_fmt(result['balance_after'])}**",
+                        False,
+                    ),
+                    ("📝 Lý do", reason[:1024], False),
+                    ("🧾 Mã giao dịch", f"`{result['transaction_code']}`", True),
+                ],
+            )
+        except ValueError as error:
+            await interaction.followup.send(f"❌ {error}", ephemeral=True)
+        except Exception as error:
+            await interaction.followup.send(
+                f"❌ Lỗi cộng tiền: `{type(error).__name__}: {error}`",
+                ephemeral=True
+            )
+
+    @app_commands.command(
+        name="trutien",
+        description="➖ Trừ tiền trong ví khi khách thanh toán"
+    )
+    @app_commands.describe(
+        member="Người bị trừ tiền",
+        amount="Số tiền, ví dụ 20k, 50k hoặc 100000",
+        reason="Lý do trừ tiền"
+    )
+    async def trutien(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        amount: str,
+        reason: str
+    ):
+        actor_rank = privileged_rank(interaction.user)
+        target_rank = privileged_rank(member)
+
+        if actor_rank < 1:
+            return await interaction.response.send_message(
+                "❌ Chỉ Support/Admin/Founder mới được dùng `/trutien`!",
+                ephemeral=True
+            )
+
+        # Support chỉ trừ member/buyer. Admin không được trừ Founder.
+        if actor_rank == 1 and target_rank >= 1:
+            return await interaction.response.send_message(
+                "❌ Support chỉ được trừ tiền của Member/Buyer!",
+                ephemeral=True
+            )
+
+        if actor_rank == 2 and target_rank >= 3:
+            return await interaction.response.send_message(
+                "❌ Admin không được trừ tiền của Founder!",
+                ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            amount_value = parse_money(amount)
+            result = db.subtract_wallet_money(
+                discord_id=member.id,
+                username=member.display_name,
+                amount=amount_value,
+                reason=reason.strip()[:250],
+                performed_by=interaction.user.id,
+                performer_name=interaction.user.display_name,
+            )
+
+            embed = discord.Embed(
+                title="✅ Đã trừ tiền trong ví",
+                color=config.COLOR_SUCCESS,
+                timestamp=datetime.now()
+            )
+            embed.add_field(name="👤 Thành viên", value=member.mention, inline=False)
+            embed.add_field(name="➖ Số tiền", value=money_fmt(amount_value), inline=True)
+            embed.add_field(
+                name="💰 Số dư",
+                value=(
+                    f"{money_fmt(result['balance_before'])} → "
+                    f"**{money_fmt(result['balance_after'])}**"
+                ),
+                inline=False
+            )
+            embed.add_field(name="📝 Lý do", value=reason[:1024], inline=False)
+            embed.add_field(
+                name="🧾 Mã giao dịch",
+                value=f"`{result['transaction_code']}`",
+                inline=True
+            )
+            embed.set_footer(text=f"Thực hiện bởi {interaction.user}")
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+            await send_wallet_log(
+                self.bot,
+                title="🟠 Đã trừ tiền trong ví",
+                color=0xE67E22,
+                fields=[
+                    ("👮 Người thực hiện", f"{interaction.user.mention}\n`{interaction.user.id}`", False),
+                    ("👤 Người bị trừ", f"{member.mention}\n`{member.id}`", False),
+                    ("➖ Số tiền", f"**{money_fmt(amount_value)}**", True),
+                    (
+                        "💳 Biến động số dư",
+                        f"{money_fmt(result['balance_before'])} → "
+                        f"**{money_fmt(result['balance_after'])}**",
+                        False,
+                    ),
+                    ("📝 Lý do", reason[:1024], False),
+                    ("🧾 Mã giao dịch", f"`{result['transaction_code']}`", True),
+                ],
+            )
+        except ValueError as error:
+            if str(error) == "INSUFFICIENT_BALANCE":
+                wallet = db.get_wallet(member.id, member.display_name)
+                return await interaction.followup.send(
+                    (
+                        "❌ Ví không đủ số dư!\n"
+                        f"Số dư hiện tại: **{money_fmt(wallet['balance'])}**"
+                    ),
+                    ephemeral=True
+                )
+
+            await interaction.followup.send(f"❌ {error}", ephemeral=True)
+        except Exception as error:
+            await interaction.followup.send(
+                f"❌ Lỗi trừ tiền: `{type(error).__name__}: {error}`",
+                ephemeral=True
+            )
 
 
-# ── Lương ────────────────────────────────────────────────────
+    @app_commands.command(
+        name="addcode",
+        description="🎟️ Tạo mã giảm giá mới (Founder only)"
+    )
+    @app_commands.describe(
+        code="Mã giảm giá (VD: SALE10K)",
+        amount="Số tiền giảm (VD: 10k, 50k, 1m)",
+        expires="Ngày hết hạn DD/MM/YYYY (để trống nếu không giới hạn)"
+    )
+    async def addcode(
+        self,
+        interaction: discord.Interaction,
+        code: str,
+        amount: str,
+        expires: str = None
+    ):
+        if not any(
+            role.id == config.FOUNDER_ROLE_ID
+            for role in interaction.user.roles
+        ):
+            return await interaction.response.send_message(
+                "❌ Chỉ Founder mới dùng được!",
+                ephemeral=True
+            )
 
-@app.route("/salary")
-@login_required
-def salary():
-    if session["role"] == "founder":
-        data = wdb.get_all_salary()
-    else:
-        data = wdb.get_salary_by_support(session["user_id"])
-    return render_template("salary.html", salary_data=data, is_all=session["role"] == "founder")
+        try:
+            text = amount.strip().lower()
 
+            if text.endswith("k"):
+                amt = int(float(text[:-1]) * 1000)
+            elif text.endswith("m"):
+                amt = int(float(text[:-1]) * 1000000)
+            else:
+                amt = int(float(text))
 
-# ── Quản lý tài khoản ────────────────────────────────────────
+            expires_at = None
 
-@app.route("/accounts")
-@login_required
-@role_required("founder")
-def accounts():
-    users = wdb.get_all_users()
-    return render_template("accounts.html", users=users)
+            if expires:
+                try:
+                    expires_at = datetime.strptime(
+                        expires.strip(),
+                        "%d/%m/%Y"
+                    ).strftime("%Y-%m-%d")
+                except ValueError:
+                    return await interaction.response.send_message(
+                        "❌ Ngày hết hạn sai định dạng! Dùng: `DD/MM/YYYY`",
+                        ephemeral=True
+                    )
 
+            db.create_discount(code, amt, expires_at)
 
-@app.route("/accounts/create", methods=["GET", "POST"])
-@login_required
-@role_required("founder")
-def create_account():
-    if request.method == "POST":
-        username     = request.form.get("username", "").strip()
-        password     = request.form.get("password", "").strip()
-        display_name = request.form.get("display_name", "").strip()
-        role         = request.form.get("role", "support")
-        discord_id   = request.form.get("discord_id", "").strip()
+            embed = discord.Embed(
+                title="✅ Đã tạo mã giảm giá",
+                color=config.COLOR_SUCCESS,
+                timestamp=datetime.now()
+            )
+            embed.add_field(
+                name="🎟️ Mã",
+                value=f"`{code.upper()}`",
+                inline=True
+            )
+            embed.add_field(
+                name="💰 Giảm",
+                value=f"{amt:,} VNĐ".replace(",", "."),
+                inline=True
+            )
+            embed.add_field(
+                name="📅 Hết hạn",
+                value=expires_at or "Không giới hạn",
+                inline=True
+            )
+            embed.set_footer(text=config.BOT_FOOTER)
 
-        if not username or not password:
-            flash("❌ Vui lòng điền đầy đủ thông tin!", "error")
-        elif wdb.get_user_by_username(username):
-            flash("❌ Tên đăng nhập đã tồn tại!", "error")
-        else:
-            wdb.create_user(username, password, display_name, role, discord_id)
-            flash(f"✅ Đã tạo tài khoản {username} ({role})!", "success")
-            return redirect(url_for("accounts"))
+            await interaction.response.send_message(
+                embed=embed,
+                ephemeral=True
+            )
 
-    return render_template("create_account.html")
+        except Exception as error:
+            await interaction.response.send_message(
+                f"❌ Lỗi: `{error}`",
+                ephemeral=True
+            )
 
+    @app_commands.command(
+        name="codes",
+        description="🎟️ Xem tất cả mã giảm giá (Founder only)"
+    )
+    async def codes(self, interaction: discord.Interaction):
+        if not any(
+            role.id == config.FOUNDER_ROLE_ID
+            for role in interaction.user.roles
+        ):
+            return await interaction.response.send_message(
+                "❌ Chỉ Founder mới dùng được!",
+                ephemeral=True
+            )
 
-@app.route("/accounts/<int:user_id>/edit", methods=["GET", "POST"])
-@login_required
-@role_required("founder")
-def edit_account(user_id):
-    conn = wdb.get_conn()
-    c    = conn.cursor()
-    c.execute("SELECT * FROM web_users WHERE id=%s", (user_id,))
-    user = c.fetchone()
-    conn.close()
+        rows = db.get_all_discounts()
 
-    if not user:
-        flash("❌ Không tìm thấy tài khoản!", "error")
-        return redirect(url_for("accounts"))
-
-    if request.method == "POST":
-        display_name = request.form.get("display_name", "").strip()
-        role         = request.form.get("role", "support")
-        discord_id   = request.form.get("discord_id", "").strip()
-
-        conn = wdb.get_conn()
-        c    = conn.cursor()
-        c.execute(
-            "UPDATE web_users SET display_name=%s, role=%s, discord_id=%s WHERE id=%s",
-            (display_name, role, discord_id, user_id)
+        embed = discord.Embed(
+            title="🎟️ Danh sách mã giảm giá",
+            color=config.COLOR_INFO,
+            timestamp=datetime.now()
         )
-        conn.commit()
-        conn.close()
-        flash("✅ Đã cập nhật tài khoản!", "success")
-        return redirect(url_for("accounts"))
 
-    return render_template("edit_account.html", user=user)
+        if not rows:
+            embed.description = "Chưa có mã nào!"
+        else:
+            for row in rows:
+                status = "✅ Còn" if not row["used"] else "❌ Đã dùng"
+                amount = f"{row['amount']:,}".replace(",", ".")
 
+                embed.add_field(
+                    name=f"`{row['code']}`",
+                    value=(
+                        f"💰 Giảm: **{amount} VNĐ**\n"
+                        f"📅 HH: {row['expires_at'] or 'Không giới hạn'}\n"
+                        f"📌 {status}"
+                    ),
+                    inline=True
+                )
 
-@app.route("/accounts/<int:user_id>/delete", methods=["POST"])
-@login_required
-@role_required("founder")
-def delete_account(user_id):
-    if user_id == session["user_id"]:
-        flash("❌ Không thể xóa tài khoản đang đăng nhập!", "error")
-    else:
-        wdb.delete_user(user_id)
-        flash("🗑️ Đã xóa tài khoản!", "success")
-    return redirect(url_for("accounts"))
+        embed.set_footer(text=config.BOT_FOOTER)
 
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True
+        )
 
-@app.route("/accounts/<int:user_id>/reset", methods=["POST"])
-@login_required
-@role_required("founder")
-def reset_password(user_id):
-    new_pass = request.form.get("new_password", "").strip()
-    if not new_pass:
-        flash("❌ Mật khẩu không được để trống!", "error")
-    else:
-        wdb.reset_password(user_id, new_pass)
-        flash("✅ Đã đặt lại mật khẩu!", "success")
-    return redirect(url_for("accounts"))
-
-
-# ── Log ───────────────────────────────────────────────────────
-
-@app.route("/logs")
-@login_required
-@role_required("founder", "admin")
-def logs():
-    conn = db.get_conn_dict()
-    c    = conn.cursor()
-    c.execute('SELECT * FROM logs ORDER BY created_at DESC LIMIT 200')
-    rows = c.fetchall()
-    conn.close()
-    return render_template("logs.html", logs=list(rows))
-
-
-# ── Bảng giá ─────────────────────────────────────────────────
-
-@app.route("/prices")
-@login_required
-def prices():
-    conn = db.get_conn_dict()
-    c    = conn.cursor()
-    c.execute("SELECT * FROM products ORDER BY category, sort_order, id")
-    rows = c.fetchall()
-    conn.close()
-
-    from collections import defaultdict
-    categories = defaultdict(list)
-    for r in rows:
-        categories[r["category"]].append(r)
-
-    return render_template("prices.html", categories=dict(categories),
-                           is_founder=session["role"] == "founder")
-
-
-@app.route("/prices/add", methods=["POST"])
-@login_required
-@role_required("founder")
-def add_product():
-    category = request.form.get("category", "").strip()
-    name     = request.form.get("name", "").strip()
-    price    = request.form.get("price", "0").strip()
-    type_    = request.form.get("type", "log").strip()
-    note     = request.form.get("note", "").strip()
-    order    = request.form.get("sort_order", "0").strip()
-
-    if not category or not name:
-        flash("❌ Vui lòng điền đầy đủ thông tin!", "error")
-        return redirect(url_for("prices"))
-
-    conn = db.get_conn()
-    c    = conn.cursor()
-    c.execute(
-        "INSERT INTO products (category, name, price, type, note, sort_order) VALUES (%s,%s,%s,%s,%s,%s)",
-        (category, name, int(price), type_, note, int(order))
+    @app_commands.command(
+        name="delcode",
+        description="🗑️ Xóa mã giảm giá (Founder only)"
     )
-    conn.commit()
-    conn.close()
-    flash(f"✅ Đã thêm sản phẩm {name}!", "success")
-    return redirect(url_for("prices"))
+    @app_commands.describe(code="Mã cần xóa")
+    async def delcode(
+        self,
+        interaction: discord.Interaction,
+        code: str
+    ):
+        if not any(
+            role.id == config.FOUNDER_ROLE_ID
+            for role in interaction.user.roles
+        ):
+            return await interaction.response.send_message(
+                "❌ Chỉ Founder mới dùng được!",
+                ephemeral=True
+            )
+
+        db.delete_discount(code)
+
+        await interaction.response.send_message(
+            f"🗑️ Đã xóa mã `{code.upper()}`!",
+            ephemeral=True
+        )
 
 
-@app.route("/prices/<int:product_id>/delete", methods=["POST"])
-@login_required
-@role_required("founder")
-def delete_product(product_id):
-    conn = db.get_conn()
-    c    = conn.cursor()
-    c.execute("DELETE FROM products WHERE id=%s", (product_id,))
-    conn.commit()
-    conn.close()
-    flash("🗑️ Đã xóa sản phẩm!", "success")
-    return redirect(url_for("prices"))
-
-@app.route("/prices/<int:product_id>/edit", methods=["POST"])
-@login_required
-@role_required("founder")
-def edit_product(product_id):
-    name  = request.form.get("name", "").strip()
-    price = request.form.get("price", "0").strip()
-    type_ = request.form.get("type", "log").strip()
-    note  = request.form.get("note", "").strip()
-    order = request.form.get("sort_order", "0").strip()
-
-    conn = db.get_conn()
-    c    = conn.cursor()
-    c.execute(
-        "UPDATE products SET name=%s, price=%s, type=%s, note=%s, sort_order=%s WHERE id=%s",
-        (name, int(price), type_, note, int(order), product_id)
-    )
-    conn.commit()
-    conn.close()
-    flash("✅ Đã cập nhật sản phẩm!", "success")
-    return redirect(url_for("prices"))
-
-
-if __name__ == "__main__":
-    db.init_db()
-    wdb.init_web_db()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
-
+async def setup(bot):
+    await bot.add_cog(SlashCog(bot))

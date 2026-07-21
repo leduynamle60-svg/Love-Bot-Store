@@ -175,14 +175,14 @@ async def send_wallet_log(
             )
 
         embed.set_footer(text=getattr(config, "BOT_FOOTER", "Love Store"))
-        await channel.send(
+        message = await channel.send(
             embed=embed,
             allowed_mentions=discord.AllowedMentions.none(),
         )
-        return True
+        return message
     except Exception as error:
         print(f"[Wallet Log] {type(error).__name__}: {error}")
-        return False
+        return None
 
 
 def ticket_number_from_channel(channel: discord.TextChannel) -> str:
@@ -1243,7 +1243,7 @@ class SlashCog(commands.Cog):
 
             await interaction.followup.send(embed=embed, ephemeral=True)
 
-            await send_wallet_log(
+            log_message = await send_wallet_log(
                 self.bot,
                 title="🟡 Yêu cầu nạp tiền mới",
                 color=0xF1C40F,
@@ -1255,6 +1255,20 @@ class SlashCog(commands.Cog):
                     ("📌 Trạng thái", "⏳ Đang chờ Founder duyệt", False),
                 ],
             )
+
+            if log_message:
+                try:
+                    await asyncio.to_thread(
+                        db.save_wallet_log_message,
+                        request["transaction_code"],
+                        log_message.channel.id,
+                        log_message.id,
+                    )
+                except Exception as save_error:
+                    print(
+                        "[Wallet Log Save] "
+                        f"{type(save_error).__name__}: {save_error}"
+                    )
         except ValueError as error:
             await interaction.followup.send(
                 f"❌ Số tiền không hợp lệ: {error}",

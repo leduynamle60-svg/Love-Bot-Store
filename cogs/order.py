@@ -763,7 +763,15 @@ class PaymentView(discord.ui.View):
 
     @discord.ui.button(label="🎟️ Nhập mã giảm giá", style=discord.ButtonStyle.secondary, custom_id="enter_discount")
     async def enter_discount(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(DiscountModal(self.order_code, self.original_amount, self))
+        if self.discounted:
+            return await interaction.response.send_message(
+                "❌ Đơn này đã áp dụng mã giảm giá rồi!",
+                ephemeral=True
+            )
+
+        await interaction.response.send_modal(
+            DiscountModal(self.order_code, self.original_amount, self)
+        )
 
 
 class DiscountModal(discord.ui.Modal, title="🎟️ Nhập mã giảm giá"):
@@ -786,7 +794,8 @@ class DiscountModal(discord.ui.Modal, title="🎟️ Nhập mã giảm giá"):
 
             if not discount:
                 return await interaction.response.send_message(
-                    "❌ Mã không hợp lệ hoặc đã được sử dụng!", ephemeral=True
+                    "❌ Mã giảm giá không tồn tại! Hãy kiểm tra lại ký tự của mã.",
+                    ephemeral=True
                 )
 
             # Kiểm tra hết hạn
@@ -803,8 +812,7 @@ class DiscountModal(discord.ui.Modal, title="🎟️ Nhập mã giảm giá"):
             amount_fmt   = f"{new_amount:,}".replace(",", ".")
             saved_fmt    = f"{discount_amt:,}".replace(",", ".")
 
-            # Đánh dấu mã đã dùng
-            db.use_discount(code)
+            # Mã được dùng chung cho nhiều khách nên không khóa mã tại đây.
 
             # Cập nhật amount trong DB
             conn = db.get_conn()
